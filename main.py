@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v44-ai-source-resilient-no-pause"
+VERSION = "v45-ai-real-source-no-fake-fallback"
 
 # New history source requested by owner. The key can be overridden through env.
 HISTORY_API_URL = os.getenv(
@@ -70,7 +70,10 @@ AI_BOOTSTRAP_EPOCHS = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "0") or 0)
 AI_RESET_ON_BOOT = (os.getenv("AI_RESET_ON_BOOT", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
 HISTORY_API_MIN_INTERVAL_SEC = int(os.getenv("HISTORY_API_MIN_INTERVAL_SEC", "28") or 28)
 HISTORY_API_BACKOFF_SEC = int(os.getenv("HISTORY_API_BACKOFF_SEC", "300") or 300)
-CLOCK_FALLBACK_ENABLE = (os.getenv("CLOCK_FALLBACK_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+# Fake/clock fallback is OFF by default. A new prediction is published only when
+# a real fresh draw is received from the history source. Set CLOCK_FALLBACK_ENABLE=1
+# only for UI demo mode; do not use it for real/autobet play.
+CLOCK_FALLBACK_ENABLE = (os.getenv("CLOCK_FALLBACK_ENABLE", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
 CLOCK_FALLBACK_AFTER_SEC = int(os.getenv("CLOCK_FALLBACK_AFTER_SEC", "45") or 45)
 
 FIREBASE_AUTOBET_URL = os.getenv(
@@ -520,13 +523,16 @@ def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
     now_ts = time.time()
     if not force:
         if now_ts < _history_api_backoff_until:
-            _update_data_source(False, DATA_SOURCE.get("http_status"), "history API backoff active")
-            return []
+            DATA_SOURCE["throttled"] = True
+            DATA_SOURCE["error"] = "history API backoff active"
+            DATA_SOURCE["next_allowed_in_sec"] = round(_history_api_backoff_until - now_ts, 1)
+            return None
         wait_left = HISTORY_API_MIN_INTERVAL_SEC - (now_ts - _history_api_last_call_ts)
         if wait_left > 0:
             DATA_SOURCE["throttled"] = True
+            DATA_SOURCE["error"] = "waiting for next allowed history API poll"
             DATA_SOURCE["next_allowed_in_sec"] = round(wait_left, 1)
-            return []
+            return None
     _history_api_last_call_ts = now_ts
     DATA_SOURCE["throttled"] = False
     DATA_SOURCE["next_allowed_in_sec"] = 0
@@ -921,15 +927,23 @@ def tick():
             time.sleep(min(10, POLL_SEC))
         return
     records = fetch_history_api(POLL_HISTORY_LIMIT, force=False)
+    # None means intentionally skipped due to throttle/backoff; do nothing.
+    if records is None:
+        return
+    # [] means the source was contacted but returned no usable rows / failed.
     if not records:
-        clock_fallback_tick(DATA_SOURCE.get("error") or "no_records")
+        if CLOCK_FALLBACK_ENABLE:
+            clock_fallback_tick(DATA_SOURCE.get("error") or "no_records")
         return
     with ENGINE.lock:
         last = ENGINE.last_period
     newer = [row for row in records if not last or period_sort_key(row["period"]) > period_sort_key(last)]
     if not newer:
-        clock_fallback_tick("source_stale_no_new_period")
+        DATA_SOURCE["source_stale"] = True
+        if CLOCK_FALLBACK_ENABLE:
+            clock_fallback_tick("source_stale_no_new_period")
         return
+    DATA_SOURCE["source_stale"] = False
     DATA_SOURCE["clock_fallback_active"] = False
     newer.sort(key=lambda row: period_sort_key(row["period"]))
     for row in newer[:-1]:
@@ -1083,7 +1097,7 @@ def root():
         "app": "DRAGO AI Main",
         "version": VERSION,
         "stream": STREAM_ID,
-        "mode": "Online neural AI; old guard predictor removed; level system active; no paper-pause",
+        "mode": "Online neural AI; real-source mode; no fake clock fallback; no paper-pause",
         "ultra_safe_mode": False,
         "paper_pause_removed": True,
         "ai": pattern.learning_status(),
@@ -1204,6 +1218,7 @@ def source_status(request: Request):
         "last_period": ENGINE.last_period,
         "clock_fallback_enabled": CLOCK_FALLBACK_ENABLE,
         "clock_fallback_count": ENGINE.clock_fallback_count,
+        "real_source_required": not CLOCK_FALLBACK_ENABLE,
         "history_api_min_interval_sec": HISTORY_API_MIN_INTERVAL_SEC,
         "history_api_backoff_sec": HISTORY_API_BACKOFF_SEC,
     }
