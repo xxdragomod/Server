@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v48-ai-v7-live-learning"
+VERSION = "v49-ai-v7-force-bootstrap-learning"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -76,7 +76,11 @@ DRAW_STORE_MIRROR_FILES = os.getenv("DRAW_STORE_MIRROR_FILES", _DRAW_STORE_DEFAU
 AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")
 # V7 trains a recent live window at startup (fast) and then keeps learning every
 # settled round. Full 10K training is too slow on small hosts, so keep a cap.
-AI_BOOTSTRAP_EPOCHS = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "1") or 1)
+AI_DISABLE_BOOTSTRAP_TRAIN = (os.getenv("AI_DISABLE_BOOTSTRAP_TRAIN", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
+_AI_BOOTSTRAP_EPOCHS_RAW = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "1") or 1)
+# Even if an old .env still has AI_BOOTSTRAP_EPOCHS=0, train once by default.
+# Use AI_DISABLE_BOOTSTRAP_TRAIN=1 only if you intentionally want no startup training.
+AI_BOOTSTRAP_EPOCHS = 0 if AI_DISABLE_BOOTSTRAP_TRAIN else max(1, _AI_BOOTSTRAP_EPOCHS_RAW)
 AI_BOOTSTRAP_TRAIN_LIMIT = int(os.getenv("AI_BOOTSTRAP_TRAIN_LIMIT", "1500") or 1500)
 AI_RESET_ON_BOOT = (os.getenv("AI_RESET_ON_BOOT", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
 HISTORY_API_MIN_INTERVAL_SEC = int(os.getenv("HISTORY_API_MIN_INTERVAL_SEC", "28") or 28)

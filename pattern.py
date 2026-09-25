@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 NAME = "ai_ensemble"
-VERSION = "ai-v7-live-adaptive-drawdown"
+VERSION = "ai-v7.1-live-adaptive-drawdown"
 
 MIN_HISTORY = int(os.getenv("AI_MIN_HISTORY", "20") or 20)
 CONF_FLOOR = int(os.getenv("AI_CONF_FLOOR", "54") or 54)
@@ -1262,7 +1262,7 @@ class OnlineAIPredictor:
         policy_memory_info = {"override": False}
         if policy_info.get("active"):
             p_big = float(policy_info["p_big"])
-            source = "AI_DRAWDOWN_POLICY_V7" if policy_info.get("phase") == "LEARNED_LIVE_DRAWDOWN_V7" else "AI_DRAWDOWN_POLICY_V6"
+            source = "AI_DRAWDOWN_POLICY_V7"
             p_big, policy_memory_info = self._policy_memory_correction(p_big, policy_info, consec_loss=consec_losses)
             if policy_memory_info.get("override"):
                 source = "AI_ONLINE_DRAWDOWN_MEMORY_V7"
@@ -1519,7 +1519,6 @@ class OnlineAIPredictor:
                 "AI_ENSEMBLE_V6",
                 "AI_MEMORY_CORRECTED_V6",
                 "AI_DRAWDOWN_RECOVERY_V6",
-                "AI_DRAWDOWN_POLICY_V6",
                 "AI_DRAWDOWN_POLICY_V7",
                 "AI_ONLINE_DRAWDOWN_MEMORY_V7",
                 "ONLINE_LOSS_LEARNING",
