@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v43-ai-highrisk-state-no-pause"
+VERSION = "v44-ai-source-resilient-no-pause"
 
 # New history source requested by owner. The key can be overridden through env.
 HISTORY_API_URL = os.getenv(
@@ -64,8 +64,14 @@ HISTORY_MAX = int(os.getenv("HISTORY_MAX", "5000") or 5000)
 DRAW_STORE_MAX = int(os.getenv("DRAW_STORE_MAX", "100000") or 100000)
 DRAW_STORE_FILE = os.getenv("DRAW_STORE_FILE", "wingo30s_history.json")
 AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")
-AI_BOOTSTRAP_EPOCHS = int(os.getenv("AI_BOOTSTRAP_EPOCHS", str(pattern.BOOTSTRAP_EPOCHS)) or pattern.BOOTSTRAP_EPOCHS)
+# V6 has embedded learned-state policy, so expensive 10K neural bootstrap is
+# disabled by default. Set AI_BOOTSTRAP_EPOCHS=1 if you explicitly want warmup training.
+AI_BOOTSTRAP_EPOCHS = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "0") or 0)
 AI_RESET_ON_BOOT = (os.getenv("AI_RESET_ON_BOOT", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
+HISTORY_API_MIN_INTERVAL_SEC = int(os.getenv("HISTORY_API_MIN_INTERVAL_SEC", "28") or 28)
+HISTORY_API_BACKOFF_SEC = int(os.getenv("HISTORY_API_BACKOFF_SEC", "300") or 300)
+CLOCK_FALLBACK_ENABLE = (os.getenv("CLOCK_FALLBACK_ENABLE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+CLOCK_FALLBACK_AFTER_SEC = int(os.getenv("CLOCK_FALLBACK_AFTER_SEC", "45") or 45)
 
 FIREBASE_AUTOBET_URL = os.getenv(
     "FIREBASE_AUTOBET_URL", "https://auto-bet-pro-default-rtdb.firebaseio.com"
@@ -113,6 +119,8 @@ _hourly_lock = threading.Lock()
 _draw_store = []
 _hourly_stats = {}
 _tg_last_level_alert = -1
+_history_api_last_call_ts = 0.0
+_history_api_backoff_until = 0.0
 
 DATA_SOURCE = {
     "ok": None,
@@ -507,7 +515,21 @@ def _api_params(limit):
     return params
 
 
-def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT):
+def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
+    global _history_api_last_call_ts, _history_api_backoff_until
+    now_ts = time.time()
+    if not force:
+        if now_ts < _history_api_backoff_until:
+            _update_data_source(False, DATA_SOURCE.get("http_status"), "history API backoff active")
+            return []
+        wait_left = HISTORY_API_MIN_INTERVAL_SEC - (now_ts - _history_api_last_call_ts)
+        if wait_left > 0:
+            DATA_SOURCE["throttled"] = True
+            DATA_SOURCE["next_allowed_in_sec"] = round(wait_left, 1)
+            return []
+    _history_api_last_call_ts = now_ts
+    DATA_SOURCE["throttled"] = False
+    DATA_SOURCE["next_allowed_in_sec"] = 0
     try:
         response = requests.get(
             HISTORY_API_URL,
@@ -516,7 +538,19 @@ def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT):
             headers={"User-Agent": "DRAGO-AI-Server/3.0", "Accept": "application/json"},
         )
         if response.status_code != 200:
-            _update_data_source(False, response.status_code, f"HTTP {response.status_code}")
+            error_text = f"HTTP {response.status_code}"
+            try:
+                body = response.text[:220]
+                if body:
+                    error_text += f" {body}"
+            except Exception:
+                pass
+            _update_data_source(False, response.status_code, error_text)
+            if response.status_code in (402, 403, 429, 500, 502, 503, 504):
+                _history_api_backoff_until = time.time() + HISTORY_API_BACKOFF_SEC
+                backoff_until = ist_now() + timedelta(seconds=HISTORY_API_BACKOFF_SEC)
+                DATA_SOURCE["backoff_until_ist"] = backoff_until.strftime("%Y-%m-%d %H:%M:%S")
+                DATA_SOURCE["backoff_sec"] = HISTORY_API_BACKOFF_SEC
             return []
         try:
             payload = response.json()
@@ -553,6 +587,8 @@ class Engine:
         self.total_final = 0
         self.wins_final = 0
         self.draw_count = 0
+        self.last_publish_wall_ts = 0.0
+        self.clock_fallback_count = 0
         self.bootstrap_info = {}
         self.analysis = {}
         self.latest = {
@@ -588,13 +624,29 @@ class Engine:
         replace_draw_store(records)
 
     def bootstrap_from_api(self):
-        records = fetch_history_api(BOOTSTRAP_HISTORY_LIMIT)
+        records = fetch_history_api(BOOTSTRAP_HISTORY_LIMIT, force=True)
+        source_name = "history_api"
+        if not records:
+            # If the paid/free external history API is exhausted, do not keep the
+            # whole server stuck. Restart from persisted local draw store instead.
+            cached_items = load_draw_store()
+            records = pattern.normalise_records(cached_items)
+            source_name = "local_draw_store"
         if not records:
             log.warning("bootstrap: no records; source=%s", DATA_SOURCE)
             return False
-        log.info("bootstrap: fetched %s records; training AI...", len(records))
+        log.info("bootstrap: loaded %s records from %s", len(records), source_name)
         analysis = pattern.deep_analyze_records(records)
-        train_info = pattern.fit_history(records, epochs=AI_BOOTSTRAP_EPOCHS, reset=AI_RESET_ON_BOOT)
+        if AI_BOOTSTRAP_EPOCHS > 0:
+            log.info("bootstrap: training AI epochs=%s...", AI_BOOTSTRAP_EPOCHS)
+            train_info = pattern.fit_history(records, epochs=AI_BOOTSTRAP_EPOCHS, reset=AI_RESET_ON_BOOT)
+        else:
+            train_info = {
+                "trained": False,
+                "reason": "AI_BOOTSTRAP_EPOCHS=0; using embedded learned-state policy",
+                "records": len(records),
+                "source": source_name,
+            }
         self.load_records(records)
         with self.lock:
             self.analysis = analysis
@@ -782,6 +834,8 @@ class Engine:
                 "total": self.total_final,
                 "draw_count": self.draw_count,
                 "history_len": len(self.history),
+                "clock_fallback_count": self.clock_fallback_count,
+                "data_source": dict(DATA_SOURCE),
                 "ai": meta,
                 "learning_status": pattern.learning_status(),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -810,6 +864,7 @@ class Engine:
                 "play_time": "N/A",
                 "timestamp": timestamp,
             }
+        self.last_publish_wall_ts = time.time()
         fb_put(FIREBASE_AUTOBET_URL, f"predictions/{STREAM_ID}", slim, FIREBASE_AUTOBET_SECRET)
         fb_put(FIREBASE_URL, f"predictions/{STREAM_ID}", self.latest, FIREBASE_SECRET)
         log.info(
@@ -828,18 +883,54 @@ class Engine:
 ENGINE = Engine()
 
 
+def clock_fallback_tick(reason="source_unavailable"):
+    """Keep prediction endpoint moving if upstream history source is stale/down.
+
+    This does not settle a real result (because no actual result was received),
+    but it prevents the API/Firebase prediction from getting stuck after the
+    external history API hits quota or temporarily stops updating.
+    """
+    if not CLOCK_FALLBACK_ENABLE or not ENGINE.bootstrapped:
+        return False
+    now_ts = time.time()
+    with ENGINE.lock:
+        if ENGINE.last_publish_wall_ts and now_ts - ENGINE.last_publish_wall_ts < CLOCK_FALLBACK_AFTER_SEC:
+            return False
+        pending_period = str((ENGINE.pending_final or {}).get("period") or "")
+        base_period = pending_period or ENGINE.last_period
+        if not base_period:
+            return False
+        # Pending prediction cannot be settled without actual result; void it and
+        # advance one issue so clients do not see the same period forever.
+        if ENGINE.pending_final:
+            log.warning("clock fallback voided unsettled prediction %s (%s)", pending_period, reason)
+            ENGINE.pending_final = None
+            pattern.clear_pending_prediction()
+        next_issue = next_period(base_period)
+        ENGINE.clock_fallback_count += 1
+        DATA_SOURCE["clock_fallback_active"] = True
+        DATA_SOURCE["clock_fallback_count"] = ENGINE.clock_fallback_count
+        DATA_SOURCE["clock_fallback_reason"] = str(reason)[:120]
+    ENGINE.publish(next_issue)
+    return True
+
+
 def tick():
     if not ENGINE.bootstrapped:
-        ENGINE.bootstrap_from_api()
+        if not ENGINE.bootstrap_from_api():
+            time.sleep(min(10, POLL_SEC))
         return
-    records = fetch_history_api(POLL_HISTORY_LIMIT)
+    records = fetch_history_api(POLL_HISTORY_LIMIT, force=False)
     if not records:
+        clock_fallback_tick(DATA_SOURCE.get("error") or "no_records")
         return
     with ENGINE.lock:
         last = ENGINE.last_period
     newer = [row for row in records if not last or period_sort_key(row["period"]) > period_sort_key(last)]
     if not newer:
+        clock_fallback_tick("source_stale_no_new_period")
         return
+    DATA_SOURCE["clock_fallback_active"] = False
     newer.sort(key=lambda row: period_sort_key(row["period"]))
     for row in newer[:-1]:
         ENGINE.on_draw(row["period"], row["number"], row.get("color"), publish_after=False)
@@ -1022,6 +1113,8 @@ def health():
             "ultra_safe_pause_hit": False,
             "bet_allowed_now": True,
             "bootstrap_info": ENGINE.bootstrap_info,
+            "clock_fallback_count": ENGINE.clock_fallback_count,
+            "last_publish_age_sec": round(time.time() - ENGINE.last_publish_wall_ts, 1) if ENGINE.last_publish_wall_ts else None,
             "learning": pattern.learning_status(),
             "data_source": dict(DATA_SOURCE),
         }
@@ -1088,7 +1181,45 @@ def ai_analysis(request: Request):
                 return json.load(handle)
         except Exception:
             pass
-    return {"success": False, "detail": "analysis not ready"}
+    items = load_draw_store()
+    records = pattern.normalise_records(items)
+    if records:
+        analysis = pattern.deep_analyze_records(records)
+        return {
+            "success": True,
+            "analysis": analysis,
+            "training": ENGINE.bootstrap_info,
+            "note": "generated from local draw store fallback",
+        }
+    return {"success": False, "detail": "analysis not ready", "data_source": dict(DATA_SOURCE)}
+
+
+@app.get("/api/source/status")
+def source_status(request: Request):
+    require_vps_auth(request)
+    return {
+        "success": True,
+        "data_source": dict(DATA_SOURCE),
+        "bootstrapped": ENGINE.bootstrapped,
+        "last_period": ENGINE.last_period,
+        "clock_fallback_enabled": CLOCK_FALLBACK_ENABLE,
+        "clock_fallback_count": ENGINE.clock_fallback_count,
+        "history_api_min_interval_sec": HISTORY_API_MIN_INTERVAL_SEC,
+        "history_api_backoff_sec": HISTORY_API_BACKOFF_SEC,
+    }
+
+
+@app.get("/api/source/resync")
+def source_resync(request: Request, limit: int = 10000):
+    require_vps_auth(request)
+    records = fetch_history_api(max(1, min(int(limit or 10000), 10000)), force=True)
+    if not records:
+        return {"success": False, "detail": "source fetch failed", "data_source": dict(DATA_SOURCE)}
+    ENGINE.load_records(records)
+    ENGINE.analysis = pattern.deep_analyze_records(records)
+    ENGINE.bootstrap_info = {"resync": True, "records": len(records), "source": "history_api"}
+    ENGINE.publish(next_period(ENGINE.last_period))
+    return {"success": True, "records": len(records), "last_period": ENGINE.last_period, "latest": ENGINE.latest}
 
 
 @app.get("/api/mistakes/recent")
