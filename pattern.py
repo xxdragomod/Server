@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 NAME = "ai_ensemble"
-VERSION = "ai-v6-highrisk-state-drawdown"
+VERSION = "ai-v7-live-adaptive-drawdown"
 
 MIN_HISTORY = int(os.getenv("AI_MIN_HISTORY", "20") or 20)
 CONF_FLOOR = int(os.getenv("AI_CONF_FLOOR", "54") or 54)
@@ -567,6 +567,24 @@ _STATE_POLICY_V6_HIGH_RISK = {(4, 'BSSBB', 6, 5, 2, 7, 9, 1): 'min1_B',
 # Key = (cl_cap8, last8_sides, last4_digits, last_digit, sequence_mod100).
 _STATE_POLICY_V6_EMERGENCY = {(4, 'BBSSBSBS', '9090', 0, 36): 'B', (4, 'BSSBSBBS', '1682', 2, 10): 'B', (4, 'SSBSBBSS', '8543', 3, 5): 'B'}
 
+# V7 live drawdown seeds learned from the newest live 10K window after the
+# source-fallback fix. These use generalized CL3+ high-risk state keys only
+# (loss count, last5 sides, recent balance, run length, recent digits, seq mod 10).
+# They are not 12-digit guards and are backed by online memory below, so the
+# running model can continue adapting after future losses.
+_STATE_POLICY_V7_LIVE_DRAWDOWN = {
+    (3, 'BSBSB', 5, 4, 1, 8, 1, 5): 'B',
+    (3, 'BBSSB', 6, 6, 1, 6, 3, 4): 'B',
+    (3, 'SSBBS', 4, 4, 1, 4, 6, 7): 'B',
+    (3, 'BBSSS', 5, 4, 3, 2, 3, 0): 'B',
+    (3, 'SSBBS', 5, 4, 1, 4, 7, 0): 'B',
+    (3, 'SSBBS', 5, 4, 1, 0, 7, 5): 'B',
+    (3, 'SBSBS', 5, 4, 1, 4, 5, 1): 'S',
+    (3, 'BSBBS', 5, 6, 1, 3, 6, 1): 'B',
+    (3, 'SSBBS', 4, 5, 1, 4, 5, 0): 'B',
+    (3, 'SSBBB', 6, 5, 3, 7, 7, 2): 'B',
+}
+
 class OnlineAIPredictor:
     def __init__(self):
         self.model = TinyNeuralNet()
@@ -858,6 +876,24 @@ class OnlineAIPredictor:
         # Preserve order, remove duplicates.
         return list(dict.fromkeys(keys))
 
+    def _policy_memory_keys(self, policy_info):
+        """Keys that let live drawdown states learn from their own mistakes."""
+        if not isinstance(policy_info, dict):
+            return []
+        keys = []
+        for name in ("high_key", "emergency_key", "state_key"):
+            value = policy_info.get(name)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                value = tuple(value)
+            keys.append(f"POL_{name.upper()}:{repr(value)}")
+        last5 = policy_info.get("last5")
+        cl = policy_info.get("cl")
+        if last5 is not None and cl is not None:
+            keys.append(f"POL_CL{min(int(cl or 0), 8)}|L5:{last5}")
+        return list(dict.fromkeys(keys))
+
     def _memory_adjust(self, p_big, keys, consec_loss=0):
         p_big = _clamp(float(p_big), 0.03, 0.97)
         side = "B" if p_big >= 0.5 else "S"
@@ -895,6 +931,49 @@ class OnlineAIPredictor:
             "keys_checked": len(keys),
             "adjustments": used[:8],
             "override": memory_override,
+        }
+
+    def _policy_memory_correction(self, p_big, policy_info, consec_loss=0):
+        """After drawdown policy picks a side, live memory can veto repeated mistakes."""
+        if (os.getenv("AI_POLICY_MEMORY_CORRECTION", "0") or "0").strip().lower() not in ("1", "true", "yes", "y", "on"):
+            return _clamp(p_big, 0.06, 0.94), {"override": False, "keys_checked": 0, "reason": "disabled_shadow_learning"}
+        cl = int(consec_loss or 0)
+        if cl < 3:
+            return _clamp(p_big, 0.06, 0.94), {"override": False, "keys_checked": 0, "reason": "cl_lt_3"}
+        side = "B" if float(p_big) >= 0.5 else "S"
+        opp = opposite(side)
+        keys = self._policy_memory_keys(policy_info)
+        best = None
+        for key in keys:
+            rec = self.memory.get(key)
+            if not rec:
+                continue
+            pred_bets = rec.get("pred_bets") or rec.get("side_bets") or {}
+            pred_losses = rec.get("pred_losses") or rec.get("side_losses") or {}
+            side_bets = int(pred_bets.get(side, 0) or 0)
+            side_losses = int(pred_losses.get(side, 0) or 0)
+            if side_bets <= 0 or side_losses <= 0:
+                continue
+            loss_rate = side_losses / side_bets
+            exact_key = key.startswith("POL_HIGH_KEY") or key.startswith("POL_EMERGENCY_KEY")
+            ok = (exact_key and side_losses >= 1 and loss_rate >= 0.99) or (side_losses >= 2 and loss_rate >= 0.66)
+            if not ok:
+                continue
+            score = loss_rate + min(cl, 8) * 0.05 + min(side_losses, 6) * 0.03
+            if best is None or score > best[0]:
+                best = (score, key, side_bets, side_losses, loss_rate)
+        if not best:
+            return _clamp(p_big, 0.06, 0.94), {"override": False, "keys_checked": len(keys)}
+        corrected = self._prob_for_side(opp, 0.64 if cl < 5 else 0.67)
+        return corrected, {
+            "override": True,
+            "from": side,
+            "to": opp,
+            "key": best[1],
+            "side_bets": best[2],
+            "side_losses": best[3],
+            "loss_rate": round(best[4], 3),
+            "keys_checked": len(keys),
         }
 
     def _policy_expert_side(self, name, hist, nums=None, event_id=None):
@@ -1050,7 +1129,11 @@ class OnlineAIPredictor:
                 int(last_num) if last_num is not None else -1,
                 seq % 100,
             )
-            if cl >= 4 and emergency_key in _STATE_POLICY_V6_EMERGENCY:
+            if cl >= 3 and high_key in _STATE_POLICY_V7_LIVE_DRAWDOWN:
+                side = _STATE_POLICY_V7_LIVE_DRAWDOWN[high_key]
+                expert_name = f"v7_live_{side}"
+                phase = "LEARNED_LIVE_DRAWDOWN_V7"
+            elif cl >= 4 and emergency_key in _STATE_POLICY_V6_EMERGENCY:
                 side = _STATE_POLICY_V6_EMERGENCY[emergency_key]
                 expert_name = f"emergency_{side}"
                 phase = "LEARNED_EMERGENCY_V6"
@@ -1176,9 +1259,13 @@ class OnlineAIPredictor:
         # optimization for lower max loss streak; the NN/ensemble still learns
         # in the background and supplies diagnostics.
         policy_info = self._drawdown_policy(hist, nums, consec_losses, event_id=event_id)
+        policy_memory_info = {"override": False}
         if policy_info.get("active"):
             p_big = float(policy_info["p_big"])
-            source = "AI_DRAWDOWN_POLICY_V6"
+            source = "AI_DRAWDOWN_POLICY_V7" if policy_info.get("phase") == "LEARNED_LIVE_DRAWDOWN_V7" else "AI_DRAWDOWN_POLICY_V6"
+            p_big, policy_memory_info = self._policy_memory_correction(p_big, policy_info, consec_loss=consec_losses)
+            if policy_memory_info.get("override"):
+                source = "AI_ONLINE_DRAWDOWN_MEMORY_V7"
 
         side = "B" if p_big >= 0.5 else "S"
 
@@ -1203,6 +1290,7 @@ class OnlineAIPredictor:
                 "memory_keys": keys,
                 "expert_votes": votes,
                 "policy": policy_info,
+                "policy_memory": policy_memory_info,
                 "event_id": str(event_id or ""),
                 "context": summary,
                 "source": source,
@@ -1222,6 +1310,7 @@ class OnlineAIPredictor:
             "memory": memory_info,
             "risk": risk_info,
             "policy": policy_info,
+            "policy_memory": policy_memory_info,
             "context": summary,
             "learning": self.learning_status(compact=True),
         }
@@ -1230,6 +1319,8 @@ class OnlineAIPredictor:
     def _update_memory(self, prediction, actual_side, actual_number=None, actual_color=None, correct=False):
         keys = prediction.get("memory_keys") or [prediction.get("signature")]
         keys = [k for k in keys if k]
+        keys.extend(self._policy_memory_keys(prediction.get("policy") or {}))
+        keys = list(dict.fromkeys(k for k in keys if k))
         if not keys:
             return
         side = prediction.get("side") if prediction.get("side") in ("B", "S") else "B"
@@ -1429,6 +1520,8 @@ class OnlineAIPredictor:
                 "AI_MEMORY_CORRECTED_V6",
                 "AI_DRAWDOWN_RECOVERY_V6",
                 "AI_DRAWDOWN_POLICY_V6",
+                "AI_DRAWDOWN_POLICY_V7",
+                "AI_ONLINE_DRAWDOWN_MEMORY_V7",
                 "ONLINE_LOSS_LEARNING",
             ],
         }

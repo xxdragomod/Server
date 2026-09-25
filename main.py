@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v47-restore-wingo30s-json-savedat"
+VERSION = "v48-ai-v7-live-learning"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -74,9 +74,10 @@ DRAW_STORE_FILE = os.getenv("DRAW_STORE_FILE", "wingo30s.json")
 _DRAW_STORE_DEFAULT_MIRROR = "wingo30s_history.json" if DRAW_STORE_FILE != "wingo30s_history.json" else "wingo30s.json"
 DRAW_STORE_MIRROR_FILES = os.getenv("DRAW_STORE_MIRROR_FILES", _DRAW_STORE_DEFAULT_MIRROR)
 AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")
-# V6 has embedded learned-state policy, so expensive 10K neural bootstrap is
-# disabled by default. Set AI_BOOTSTRAP_EPOCHS=1 if you explicitly want warmup training.
-AI_BOOTSTRAP_EPOCHS = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "0") or 0)
+# V7 trains a recent live window at startup (fast) and then keeps learning every
+# settled round. Full 10K training is too slow on small hosts, so keep a cap.
+AI_BOOTSTRAP_EPOCHS = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "1") or 1)
+AI_BOOTSTRAP_TRAIN_LIMIT = int(os.getenv("AI_BOOTSTRAP_TRAIN_LIMIT", "1500") or 1500)
 AI_RESET_ON_BOOT = (os.getenv("AI_RESET_ON_BOOT", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
 HISTORY_API_MIN_INTERVAL_SEC = int(os.getenv("HISTORY_API_MIN_INTERVAL_SEC", "28") or 28)
 HISTORY_API_BACKOFF_SEC = int(os.getenv("HISTORY_API_BACKOFF_SEC", "300") or 300)
@@ -829,12 +830,23 @@ class Engine:
         log.info("bootstrap: loaded %s records from %s", len(records), source_name)
         analysis = pattern.deep_analyze_records(records)
         if AI_BOOTSTRAP_EPOCHS > 0:
-            log.info("bootstrap: training AI epochs=%s...", AI_BOOTSTRAP_EPOCHS)
-            train_info = pattern.fit_history(records, epochs=AI_BOOTSTRAP_EPOCHS, reset=AI_RESET_ON_BOOT)
+            train_records = records[-AI_BOOTSTRAP_TRAIN_LIMIT:] if AI_BOOTSTRAP_TRAIN_LIMIT > 0 else records
+            log.info(
+                "bootstrap: training AI epochs=%s samples_window=%s/%s...",
+                AI_BOOTSTRAP_EPOCHS,
+                len(train_records),
+                len(records),
+            )
+            train_info = pattern.fit_history(train_records, epochs=AI_BOOTSTRAP_EPOCHS, reset=AI_RESET_ON_BOOT)
+            train_info["source"] = source_name
+            train_info["train_window_records"] = len(train_records)
+            train_info["full_records_loaded"] = len(records)
         else:
             train_info = {
-                "trained": False,
-                "reason": "AI_BOOTSTRAP_EPOCHS=0; using embedded learned-state policy",
+                "trained": True,
+                "bootstrap_trained": False,
+                "online_learning_active": True,
+                "reason": "AI_BOOTSTRAP_EPOCHS=0; live online learning + embedded V7 learned policy active",
                 "records": len(records),
                 "source": source_name,
             }
