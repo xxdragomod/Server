@@ -46,13 +46,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v45-ai-real-source-no-fake-fallback"
+VERSION = "v46-ai-source-fallback-level-fix"
 
-# New history source requested by owner. The key can be overridden through env.
-HISTORY_API_URL = os.getenv(
-    "HISTORY_API_URL",
-    "https://dragopredictor.onrender.com/v1/wingo30s/history",
+# History source.  Prefer old host env names too, so deployments that already
+# had API_URL/SOURCE_API keep working "jaise pehle tha".
+DEFAULT_DRAGO_HISTORY_API_URL = "https://dragopredictor.onrender.com/v1/wingo30s/history"
+DEFAULT_DIRECT_HISTORY_API_URL = "https://draw.ar-lottery02.com/WinGo/WinGo_30S/GetHistoryIssuePage.json"
+HISTORY_API_URL = (
+    os.getenv("HISTORY_API_URL")
+    or os.getenv("API_URL")
+    or os.getenv("SOURCE_API")
+    or DEFAULT_DRAGO_HISTORY_API_URL
 ).strip()
+HISTORY_FALLBACK_URLS = (os.getenv("HISTORY_FALLBACK_URLS") or DEFAULT_DIRECT_HISTORY_API_URL).strip()
 HISTORY_API_KEY = os.getenv(
     "HISTORY_API_KEY",
     "drago_d5b31311d951cec50aa1894ef614ebc73c039e0bacaf44c8",
@@ -73,7 +79,8 @@ HISTORY_API_BACKOFF_SEC = int(os.getenv("HISTORY_API_BACKOFF_SEC", "300") or 300
 # Fake/clock fallback is OFF by default. A new prediction is published only when
 # a real fresh draw is received from the history source. Set CLOCK_FALLBACK_ENABLE=1
 # only for UI demo mode; do not use it for real/autobet play.
-CLOCK_FALLBACK_ENABLE = (os.getenv("CLOCK_FALLBACK_ENABLE", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+# Hard-disabled: fallback without real result made repeated SMALL/L2 predictions.
+CLOCK_FALLBACK_ENABLE = False
 CLOCK_FALLBACK_AFTER_SEC = int(os.getenv("CLOCK_FALLBACK_AFTER_SEC", "45") or 45)
 
 FIREBASE_AUTOBET_URL = os.getenv(
@@ -132,7 +139,7 @@ DATA_SOURCE = {
     "consecutive_failures": 0,
     "last_success_at": "",
     "last_attempt_at": "",
-    "source": "dragopredictor_history_api",
+    "source": HISTORY_API_URL,
 }
 
 
@@ -509,13 +516,93 @@ def _update_data_source(ok, http_status=None, error=""):
         DATA_SOURCE["consecutive_failures"] += 1
 
 
-def _api_params(limit):
-    params = {"limit": int(limit)}
-    parsed = urlparse(HISTORY_API_URL)
+def _safe_url(url):
+    try:
+        parsed = urlparse(str(url))
+        query = parse_qs(parsed.query)
+        if "api_key" in query:
+            return str(url).replace(query["api_key"][0], "***")
+    except Exception:
+        pass
+    return str(url)
+
+
+def _history_source_urls():
+    urls = []
+    for raw in [HISTORY_API_URL, *(HISTORY_FALLBACK_URLS.split(",") if HISTORY_FALLBACK_URLS else [])]:
+        url = str(raw or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _api_params(url, limit):
+    parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    if HISTORY_API_KEY and "api_key" not in query:
-        params["api_key"] = HISTORY_API_KEY
+    host = (parsed.netloc or "").lower()
+    params = {}
+    # DRAGO/custom APIs accept limit + api_key.  The direct WinGo endpoint usually
+    # rejects unnecessary bot-looking params, so keep it clean.
+    if "dragopredictor" in host or "api_key" in query or "limit" in query:
+        params["limit"] = int(limit)
+        if HISTORY_API_KEY and "api_key" not in query:
+            params["api_key"] = HISTORY_API_KEY
+    elif "ar-lottery" not in host:
+        params["limit"] = int(limit)
     return params
+
+
+def _api_headers(url):
+    host = (urlparse(url).netloc or "").lower()
+    if "ar-lottery" in host:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://draw.ar-lottery01.com/",
+            "Origin": "https://draw.ar-lottery01.com",
+            "Cache-Control": "no-cache",
+        }
+    return {"User-Agent": "DRAGO-AI-Server/4.0", "Accept": "application/json"}
+
+
+def _extract_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return (
+        payload.get("items")
+        or payload.get("list")
+        or data.get("list")
+        or data.get("items")
+        or []
+    )
+
+
+def _fetch_one_history_source(url, limit):
+    try:
+        response = requests.get(
+            url,
+            params=_api_params(url, limit),
+            timeout=25,
+            headers=_api_headers(url),
+        )
+        if response.status_code != 200:
+            body = ""
+            try:
+                body = response.text[:180]
+            except Exception:
+                pass
+            return [], response.status_code, f"HTTP {response.status_code} {body}".strip(), {}
+        try:
+            payload = response.json()
+        except Exception:
+            return [], response.status_code, "JSON parse error", {}
+        records = pattern.normalise_records(_extract_items(payload))
+        return records, response.status_code, "", payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        return [], None, str(exc)[:180], {}
 
 
 def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
@@ -536,48 +623,58 @@ def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
     _history_api_last_call_ts = now_ts
     DATA_SOURCE["throttled"] = False
     DATA_SOURCE["next_allowed_in_sec"] = 0
-    try:
-        response = requests.get(
-            HISTORY_API_URL,
-            params=_api_params(limit),
-            timeout=25,
-            headers={"User-Agent": "DRAGO-AI-Server/3.0", "Accept": "application/json"},
-        )
-        if response.status_code != 200:
-            error_text = f"HTTP {response.status_code}"
-            try:
-                body = response.text[:220]
-                if body:
-                    error_text += f" {body}"
-            except Exception:
-                pass
-            _update_data_source(False, response.status_code, error_text)
-            if response.status_code in (402, 403, 429, 500, 502, 503, 504):
-                _history_api_backoff_until = time.time() + HISTORY_API_BACKOFF_SEC
-                backoff_until = ist_now() + timedelta(seconds=HISTORY_API_BACKOFF_SEC)
-                DATA_SOURCE["backoff_until_ist"] = backoff_until.strftime("%Y-%m-%d %H:%M:%S")
-                DATA_SOURCE["backoff_sec"] = HISTORY_API_BACKOFF_SEC
-            return []
-        try:
-            payload = response.json()
-        except Exception:
-            _update_data_source(False, response.status_code, "JSON parse error")
-            return []
-        items = []
-        if isinstance(payload, list):
-            items = payload
-        elif isinstance(payload, dict):
-            items = payload.get("items") or (payload.get("data") or {}).get("list") or []
-        records = pattern.normalise_records(items)
-        _update_data_source(True, response.status_code, "")
-        DATA_SOURCE["count"] = len(records)
+
+    attempts = []
+    merged = {}
+    freshest = None
+    for url in _history_source_urls():
+        records, status, error, payload = _fetch_one_history_source(url, limit)
+        latest_period = records[-1]["period"] if records else ""
+        safe = _safe_url(url)
+        attempt = {
+            "source": safe,
+            "ok": bool(records),
+            "http_status": status,
+            "count": len(records),
+            "latest_period": latest_period,
+            "error": error[:180] if error else "",
+        }
+        attempts.append(attempt)
+        for row in records:
+            merged[row["period"]] = row
+        if records and (freshest is None or period_sort_key(latest_period) > period_sort_key(freshest["latest_period"])):
+            freshest = {
+                "status": status,
+                "payload": payload,
+                "source": safe,
+                "latest_period": latest_period,
+            }
+
+    DATA_SOURCE["attempts"] = attempts[-5:]
+    DATA_SOURCE["sources"] = [_safe_url(u) for u in _history_source_urls()]
+    if merged and freshest:
+        combined = [merged[k] for k in sorted(merged, key=period_sort_key)]
+        _update_data_source(True, freshest["status"], "")
+        DATA_SOURCE["source"] = freshest["source"]
+        DATA_SOURCE["count"] = len(combined)
         DATA_SOURCE["limit"] = int(limit)
-        DATA_SOURCE["api_updated_at"] = payload.get("updated_at") if isinstance(payload, dict) else ""
-        return records
-    except Exception as exc:
-        _update_data_source(False, None, str(exc)[:180])
-        log.warning("history API fetch error: %s", exc)
-        return []
+        DATA_SOURCE["latest_period"] = combined[-1]["period"]
+        DATA_SOURCE["api_updated_at"] = freshest["payload"].get("updated_at") if isinstance(freshest["payload"], dict) else ""
+        return combined
+
+    error_text = "; ".join(
+        f"{a.get('source')} -> {a.get('error') or a.get('http_status')}" for a in attempts
+    )[:240] or "no history source configured"
+    last_status = attempts[-1].get("http_status") if attempts else None
+    _update_data_source(False, last_status, error_text)
+    bad_statuses = {a.get("http_status") for a in attempts}
+    if bad_statuses.intersection({402, 403, 429, 500, 502, 503, 504}):
+        _history_api_backoff_until = time.time() + HISTORY_API_BACKOFF_SEC
+        backoff_until = ist_now() + timedelta(seconds=HISTORY_API_BACKOFF_SEC)
+        DATA_SOURCE["backoff_until_ist"] = backoff_until.strftime("%Y-%m-%d %H:%M:%S")
+        DATA_SOURCE["backoff_sec"] = HISTORY_API_BACKOFF_SEC
+    log.warning("history sources failed: %s", error_text)
+    return []
 
 
 class Engine:
@@ -789,6 +886,7 @@ class Engine:
             # Pause mode removed: play always stays active.
             bet_allowed = True
             play_signal = "PLAY"
+            level_at_pred = self.loss.level
             self.pending_final = {
                 "side": side,
                 "period": next_issue,
@@ -796,6 +894,9 @@ class Engine:
                 "method": method,
                 "source": method,
                 "ai_meta": meta,
+                "level_at_pred": level_at_pred,
+                "level_at_prediction": level_at_pred,
+                "consec_losses_at_pred": self.loss.consec_losses,
                 "bet_allowed": True,
                 "play_signal": "PLAY",
                 "paper_only": False,
@@ -817,7 +918,9 @@ class Engine:
                 "prediction": prediction,
                 "prediction_code": side,
                 "confidence": confidence,
-                "level": self.loss.level,
+                "level": level_at_pred,
+                "level_at_pred": level_at_pred,
+                "level_at_prediction": level_at_pred,
                 "badge": self.loss.badge(),
                 "consec_losses": self.loss.consec_losses,
                 "level_desc": level_desc,
@@ -853,7 +956,9 @@ class Engine:
                 "period": next_issue,
                 "prediction": prediction,
                 "confidence": confidence,
-                "level": self.loss.level,
+                "level": level_at_pred,
+                "level_at_pred": level_at_pred,
+                "level_at_prediction": level_at_pred,
                 "badge": self.loss.badge(),
                 "consec_losses": self.loss.consec_losses,
                 "level_desc": level_desc,
@@ -1097,7 +1202,7 @@ def root():
         "app": "DRAGO AI Main",
         "version": VERSION,
         "stream": STREAM_ID,
-        "mode": "Online neural AI; real-source mode; no fake clock fallback; no paper-pause",
+        "mode": "Online neural AI; source fallback enabled; fake clock fallback hard-disabled; no paper-pause",
         "ultra_safe_mode": False,
         "paper_pause_removed": True,
         "ai": pattern.learning_status(),
@@ -1219,6 +1324,7 @@ def source_status(request: Request):
         "clock_fallback_enabled": CLOCK_FALLBACK_ENABLE,
         "clock_fallback_count": ENGINE.clock_fallback_count,
         "real_source_required": not CLOCK_FALLBACK_ENABLE,
+        "source_urls": [_safe_url(u) for u in _history_source_urls()],
         "history_api_min_interval_sec": HISTORY_API_MIN_INTERVAL_SEC,
         "history_api_backoff_sec": HISTORY_API_BACKOFF_SEC,
     }
@@ -1232,9 +1338,35 @@ def source_resync(request: Request, limit: int = 10000):
         return {"success": False, "detail": "source fetch failed", "data_source": dict(DATA_SOURCE)}
     ENGINE.load_records(records)
     ENGINE.analysis = pattern.deep_analyze_records(records)
-    ENGINE.bootstrap_info = {"resync": True, "records": len(records), "source": "history_api"}
+    ENGINE.bootstrap_info = {"resync": True, "records": len(records), "source": DATA_SOURCE.get("source") or "history_api"}
     ENGINE.publish(next_period(ENGINE.last_period))
     return {"success": True, "records": len(records), "last_period": ENGINE.last_period, "latest": ENGINE.latest}
+
+
+@app.get("/api/level/reset")
+def level_reset(request: Request, clear_pending: int = 1, publish: int = 1):
+    """Manual repair endpoint for polluted live state (for example old fake fallback L2)."""
+    require_vps_auth(request)
+    with ENGINE.lock:
+        ENGINE.loss.consec_losses = 0
+        ENGINE.loss.max_consec_today = 0
+        ENGINE.loss.save_state()
+        if int(clear_pending or 0):
+            ENGINE.pending_final = None
+            try:
+                pattern.clear_pending_prediction()
+            except Exception:
+                pass
+        last_period = ENGINE.last_period
+    if int(publish or 0) and last_period:
+        ENGINE.publish(next_period(last_period))
+    return {
+        "success": True,
+        "level": ENGINE.loss.level,
+        "consec_losses": ENGINE.loss.consec_losses,
+        "cleared_pending": bool(int(clear_pending or 0)),
+        "latest": ENGINE.latest,
+    }
 
 
 @app.get("/api/mistakes/recent")
