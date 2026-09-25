@@ -5,6 +5,7 @@ __pycache__/
 
 # Runtime state/logs
 level_state.json
+wingo30s.json
 wingo30s_history.json
 mistakes.jsonl
 ai_model_state.json

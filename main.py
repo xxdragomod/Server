@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v46-ai-source-fallback-level-fix"
+VERSION = "v47-restore-wingo30s-json-savedat"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -68,7 +68,11 @@ POLL_HISTORY_LIMIT = int(os.getenv("POLL_HISTORY_LIMIT", "200") or 200)
 POLL_SEC = int(os.getenv("POLL_SEC", "3") or 3)
 HISTORY_MAX = int(os.getenv("HISTORY_MAX", "5000") or 5000)
 DRAW_STORE_MAX = int(os.getenv("DRAW_STORE_MAX", "100000") or 100000)
-DRAW_STORE_FILE = os.getenv("DRAW_STORE_FILE", "wingo30s_history.json")
+# Old live server used wingo30s.json with root data/savedAt and up to 1 lakh rows.
+# Keep that behaviour, while also mirroring the newer wingo30s_history.json name.
+DRAW_STORE_FILE = os.getenv("DRAW_STORE_FILE", "wingo30s.json")
+_DRAW_STORE_DEFAULT_MIRROR = "wingo30s_history.json" if DRAW_STORE_FILE != "wingo30s_history.json" else "wingo30s.json"
+DRAW_STORE_MIRROR_FILES = os.getenv("DRAW_STORE_MIRROR_FILES", _DRAW_STORE_DEFAULT_MIRROR)
 AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")
 # V6 has embedded learned-state policy, so expensive 10K neural bootstrap is
 # disabled by default. Set AI_BOOTSTRAP_EPOCHS=1 if you explicitly want warmup training.
@@ -404,54 +408,138 @@ def _issue_key(row):
     return str(value).strip() if value is not None else None
 
 
-def load_draw_store():
-    global _draw_store
-    with _draw_store_lock:
-        if _draw_store:
-            return list(_draw_store)
-        try:
-            if os.path.exists(DRAW_STORE_FILE):
-                with open(DRAW_STORE_FILE, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                _draw_store = data if isinstance(data, list) else data.get("items", [])
-            else:
-                _draw_store = []
-        except Exception as exc:
-            log.warning("draw store load: %s", exc)
-            _draw_store = []
-        return list(_draw_store)
+def _draw_store_files():
+    files = []
+    for raw in [DRAW_STORE_FILE, *(DRAW_STORE_MIRROR_FILES.split(",") if DRAW_STORE_MIRROR_FILES else [])]:
+        path = str(raw or "").strip()
+        if path and path not in files:
+            files.append(path)
+    return files
 
 
-def save_draw_store():
-    with _draw_store_lock:
-        payload = {
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "count": len(_draw_store),
-            "items": _draw_store,
-        }
-        temporary = DRAW_STORE_FILE + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, separators=(",", ":"))
-        os.replace(temporary, DRAW_STORE_FILE)
+def _extract_store_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("items", "data", "records", "history"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return list(value.values())
+    # Firebase-style indexed object: {"1": {...}, "2": {...}}
+    if payload and all(isinstance(v, dict) for v in payload.values()):
+        return list(payload.values())
+    return []
 
 
-def _draw_row(period, number, color=None):
+def _draw_row(period, number, color=None, saved_at=None):
     number = int(number)
     side = number_to_size_letter(number)
+    saved_at = saved_at or datetime.now(timezone.utc).isoformat()
     return {
         "issueNumber": str(period).strip(),
         "number": str(number),
         "color": pattern.clean_color(color, number),
         "size": "big" if side == "B" else "small",
+        "savedAt": saved_at,
     }
 
 
-def replace_draw_store(records):
-    global _draw_store
-    rows = [_draw_row(r["period"], r["number"], r.get("color")) for r in records]
+def _normalise_store_item(item, fallback_saved_at=None):
+    if not isinstance(item, dict):
+        return None
+    period = _issue_key(item)
+    number = item.get("number")
+    if period is None or number is None:
+        return None
+    try:
+        return _draw_row(
+            period,
+            number,
+            item.get("color"),
+            item.get("savedAt") or item.get("saved_at") or item.get("timestamp") or fallback_saved_at,
+        )
+    except Exception:
+        return None
+
+
+def _normalise_store_items(items, fallback_saved_at=None):
+    dedup = {}
+    for item in items or []:
+        row = _normalise_store_item(item, fallback_saved_at=fallback_saved_at)
+        if row:
+            dedup[row["issueNumber"]] = row
+    rows = list(dedup.values())
     rows.sort(key=lambda row: period_sort_key(row["issueNumber"]), reverse=True)
+    return rows[:DRAW_STORE_MAX]
+
+
+def _draw_store_payload(items=None):
+    rows = list(_draw_store if items is None else items)[:DRAW_STORE_MAX]
+    saved_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "success": True,
+        "savedAt": saved_at,
+        "savedAtIst": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": saved_at,
+        "count": len(rows),
+        "limit": DRAW_STORE_MAX,
+        # Keep both names: old clients used data, newer endpoint used items.
+        "data": rows,
+        "items": rows,
+    }
+
+
+def load_draw_store():
+    global _draw_store
     with _draw_store_lock:
-        _draw_store = rows[:DRAW_STORE_MAX]
+        if _draw_store:
+            return list(_draw_store)
+        for path in _draw_store_files():
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                fallback_saved_at = None
+                if isinstance(data, dict):
+                    fallback_saved_at = data.get("savedAt") or data.get("updated_at")
+                _draw_store = _normalise_store_items(_extract_store_items(data), fallback_saved_at=fallback_saved_at)
+                log.info("draw store loaded %s rows from %s", len(_draw_store), path)
+                return list(_draw_store)
+            except Exception as exc:
+                log.warning("draw store load %s: %s", path, exc)
+        _draw_store = []
+        return []
+
+
+def save_draw_store():
+    with _draw_store_lock:
+        _draw_store.sort(key=lambda row: period_sort_key(row.get("issueNumber")), reverse=True)
+        del _draw_store[DRAW_STORE_MAX:]
+        payload = _draw_store_payload(_draw_store)
+        for path in _draw_store_files():
+            temporary = path + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"), ensure_ascii=False)
+            os.replace(temporary, path)
+
+
+def replace_draw_store(records):
+    """Merge freshly fetched records into the 1-lakh local store; do not wipe old rows."""
+    global _draw_store
+    existing = load_draw_store()
+    now_saved_at = datetime.now(timezone.utc).isoformat()
+    rows = [_draw_row(r["period"], r["number"], r.get("color"), saved_at=now_saved_at) for r in records]
+    dedup = {row["issueNumber"]: row for row in _normalise_store_items(existing)}
+    for row in rows:
+        dedup[row["issueNumber"]] = row
+    merged = list(dedup.values())
+    merged.sort(key=lambda row: period_sort_key(row["issueNumber"]), reverse=True)
+    with _draw_store_lock:
+        _draw_store = merged[:DRAW_STORE_MAX]
     try:
         save_draw_store()
     except Exception as exc:
@@ -1254,13 +1342,20 @@ def get_history(request: Request, limit: int = 100000):
     require_vps_auth(request)
     limit = max(1, min(int(limit or 100000), DRAW_STORE_MAX))
     items = load_draw_store()[:limit]
-    return {
-        "success": True,
-        "count": len(items),
-        "limit": limit,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "items": items,
-    }
+    payload = _draw_store_payload(items)
+    payload["limit"] = limit
+    return payload
+
+
+@app.get("/wingo30s.json")
+def wingo30s_json(limit: int = 100000):
+    """Backward-compatible public JSON cache: data + savedAt, max 1 lakh rows."""
+    limit = max(1, min(int(limit or 100000), DRAW_STORE_MAX))
+    items = load_draw_store()[:limit]
+    payload = _draw_store_payload(items)
+    payload["limit"] = limit
+    payload["file"] = DRAW_STORE_FILE
+    return payload
 
 
 @app.get("/api/debug")
@@ -1325,6 +1420,9 @@ def source_status(request: Request):
         "clock_fallback_count": ENGINE.clock_fallback_count,
         "real_source_required": not CLOCK_FALLBACK_ENABLE,
         "source_urls": [_safe_url(u) for u in _history_source_urls()],
+        "draw_store_files": _draw_store_files(),
+        "draw_store_count": len(load_draw_store()),
+        "draw_store_max": DRAW_STORE_MAX,
         "history_api_min_interval_sec": HISTORY_API_MIN_INTERVAL_SEC,
         "history_api_backoff_sec": HISTORY_API_BACKOFF_SEC,
     }
