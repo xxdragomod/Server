@@ -1,0 +1,25 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime state/logs
+level_state.json
+wingo30s_history.json
+mistakes.jsonl
+ai_model_state.json
+ai_analysis.json
+*.tmp
+
+# Local data snapshots / backtest cache
+data/
+backtest_history_cache.json
+ai_backtest_10k_stats.json
+AI_BACKTEST_10K_REPORT.md
+AI_V3_IMPROVEMENT_REPORT.md
+AI_V4_STRICT_IMPROVEMENT_REPORT.md
+AI_V5_LEARNED_STATE_REPORT.md
+AI_V6_HIGHRISK_STATE_REPORT.md
+AI_ULTRA_SAFE_10K_REPORT.md
+ai_ultra_safe_10k_stats.json
+AI_ANALYSIS_REPORT.md
