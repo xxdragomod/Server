@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 NAME = "ai_ensemble"
-VERSION = "ai-v7.2-live-ahead-strong-learning"
+VERSION = "ai-v8-online-policy-learning"
 
 MIN_HISTORY = int(os.getenv("AI_MIN_HISTORY", "20") or 20)
 CONF_FLOOR = int(os.getenv("AI_CONF_FLOOR", "54") or 54)
@@ -604,6 +604,12 @@ _STATE_POLICY_V7_LIVE_DRAWDOWN = {
     (3, 'SSBBB', 4, 5, 3, 8, 8, 2): 'S',
     (4, 'SBSSB', 4, 5, 1, 5, 0, 3): 'B',
     (3, 'SBSSB', 6, 7, 1, 6, 3, 8): 'B',
+    # V8 refresh after observed live L12 recovery around 20260926100050134.
+    (3, 'SBSSB', 7, 6, 1, 8, 2, 6): 'B',
+    (3, 'SSBBS', 4, 4, 1, 4, 6, 8): 'B',
+    (3, 'BBSSS', 5, 6, 3, 4, 3, 2): 'S',
+    (3, 'BBSSS', 5, 4, 3, 3, 0, 2): 'B',
+    (3, 'SSBBS', 4, 4, 1, 2, 9, 4): 'B',
 }
 
 class OnlineAIPredictor:
@@ -630,6 +636,10 @@ class OnlineAIPredictor:
         }
         self.last_prediction = None
         self.last_analysis = None
+        # Runtime policy learner: high-drawdown policy states learned while live.
+        # This makes the drawdown layer adapt from both wins and losses instead
+        # of relying only on embedded seed states.
+        self.live_policy = {}
         self._bulk_training = False
 
     def _default_expert_weights(self):
@@ -663,6 +673,7 @@ class OnlineAIPredictor:
             data = json.loads(path.read_text(encoding="utf-8"))
             self.model.load_dict(data.get("model") or {})
             self.memory = data.get("memory") or {}
+            self.live_policy = data.get("live_policy") or {}
             weights = data.get("expert_weights") or {}
             defaults = self._default_expert_weights()
             defaults.update({k: float(v) for k, v in weights.items() if k in defaults})
@@ -704,6 +715,7 @@ class OnlineAIPredictor:
                 "saved_at": time.time(),
                 "model": self.model.to_dict(),
                 "memory": self.memory,
+                "live_policy": self.live_policy,
                 "expert_weights": self.expert_weights,
                 "expert_recent": self.expert_recent,
                 "stats": self.stats,
@@ -914,6 +926,75 @@ class OnlineAIPredictor:
         if last5 is not None and cl is not None:
             keys.append(f"POL_CL{min(int(cl or 0), 8)}|L5:{last5}")
         return list(dict.fromkeys(keys))
+
+    def _live_policy_key(self, policy_info):
+        if not isinstance(policy_info, dict):
+            return None
+        value = policy_info.get("high_key")
+        cl = int(policy_info.get("cl", 0) or 0)
+        if value is None or cl < 3:
+            return None
+        if isinstance(value, list):
+            value = tuple(value)
+        return repr(value)
+
+    def _live_policy_side(self, high_key):
+        key = repr(tuple(high_key)) if isinstance(high_key, (tuple, list)) else str(high_key)
+        rec = self.live_policy.get(key)
+        if not isinstance(rec, dict):
+            return None, None
+        scores = rec.get("score") or {}
+        b_score = float(scores.get("B", 0) or 0)
+        s_score = float(scores.get("S", 0) or 0)
+        bets = int(rec.get("bets", 0) or 0)
+        # Learn immediately, but only override after repeated/strong evidence.
+        # This avoids one random loss overfitting the live policy.
+        if bets < 2 or max(b_score, s_score) < 4.0 or abs(b_score - s_score) < 2.0:
+            return None, rec
+        return ("B" if b_score > s_score else "S"), rec
+
+    def _update_live_policy(self, prediction, actual_side, correct=False):
+        """Online policy learner updated on BOTH wins and losses.
+
+        Loss: strongly rewards the actual side and penalizes the failed side.
+        Win: reinforces the side that worked, but less aggressively.
+        """
+        policy = prediction.get("policy") or {}
+        key = self._live_policy_key(policy)
+        if not key or actual_side not in ("B", "S"):
+            return
+        predicted = prediction.get("side") if prediction.get("side") in ("B", "S") else None
+        rec = self.live_policy.setdefault(
+            key,
+            {
+                "bets": 0,
+                "wins": 0,
+                "losses": 0,
+                "score": {"B": 0.0, "S": 0.0},
+                "actual": {"B": 0, "S": 0},
+                "last_seen": 0.0,
+                "policy": {"high_key": policy.get("high_key"), "state_key": policy.get("state_key")},
+            },
+        )
+        rec["bets"] = int(rec.get("bets", 0) or 0) + 1
+        rec["wins"] = int(rec.get("wins", 0) or 0) + (1 if correct else 0)
+        rec["losses"] = int(rec.get("losses", 0) or 0) + (0 if correct else 1)
+        actual_counts = rec.setdefault("actual", {"B": 0, "S": 0})
+        actual_counts[actual_side] = int(actual_counts.get(actual_side, 0) or 0) + 1
+        score = rec.setdefault("score", {"B": 0.0, "S": 0.0})
+        if correct:
+            score[actual_side] = float(score.get(actual_side, 0) or 0) + 1.0
+        else:
+            # Strong loss correction so repeated high-risk state flips quickly.
+            score[actual_side] = float(score.get(actual_side, 0) or 0) + 3.0
+            if predicted in ("B", "S"):
+                score[predicted] = float(score.get(predicted, 0) or 0) - 1.5
+        rec["side"] = "B" if float(score.get("B", 0) or 0) >= float(score.get("S", 0) or 0) else "S"
+        rec["last_seen"] = time.time()
+        # Keep runtime policy memory bounded.
+        if len(self.live_policy) > 1200:
+            items = sorted(self.live_policy.items(), key=lambda kv: float(kv[1].get("last_seen", 0) or 0), reverse=True)[:1000]
+            self.live_policy = dict(items)
 
     def _memory_adjust(self, p_big, keys, consec_loss=0):
         p_big = _clamp(float(p_big), 0.03, 0.97)
@@ -1154,7 +1235,12 @@ class OnlineAIPredictor:
                 int(last_num) if last_num is not None else -1,
                 seq % 100,
             )
-            if cl >= 3 and high_key in _STATE_POLICY_V7_LIVE_DRAWDOWN:
+            live_side, live_rec = self._live_policy_side(high_key)
+            if cl >= 3 and live_side in ("B", "S"):
+                side = live_side
+                expert_name = f"online_policy_{side}"
+                phase = "ONLINE_POLICY_LEARNED_V8"
+            elif cl >= 3 and high_key in _STATE_POLICY_V7_LIVE_DRAWDOWN:
                 side = _STATE_POLICY_V7_LIVE_DRAWDOWN[high_key]
                 expert_name = f"v7_live_{side}"
                 phase = "LEARNED_LIVE_DRAWDOWN_V7"
@@ -1180,6 +1266,7 @@ class OnlineAIPredictor:
             "state_key": state_key,
             "high_key": locals().get("high_key"),
             "emergency_key": locals().get("emergency_key"),
+            "live_policy": locals().get("live_rec"),
             "cl": cl,
             "last5": "".join(last5),
             "last10": "".join(last10),
@@ -1287,7 +1374,7 @@ class OnlineAIPredictor:
         policy_memory_info = {"override": False}
         if policy_info.get("active"):
             p_big = float(policy_info["p_big"])
-            source = "AI_DRAWDOWN_POLICY_V7"
+            source = "ONLINE_POLICY_LEARNED_V8" if policy_info.get("phase") == "ONLINE_POLICY_LEARNED_V8" else "AI_DRAWDOWN_POLICY_V7"
             p_big, policy_memory_info = self._policy_memory_correction(p_big, policy_info, consec_loss=consec_losses)
             if policy_memory_info.get("override"):
                 source = "AI_ONLINE_DRAWDOWN_MEMORY_V7"
@@ -1411,6 +1498,7 @@ class OnlineAIPredictor:
             losses.append(loss)
         self._update_experts(prediction, actual_side, correct)
         self._update_memory(prediction, actual_side, actual_number, actual_color, correct)
+        self._update_live_policy(prediction, actual_side, correct)
         self.stats["bets"] = int(self.stats.get("bets", 0) or 0) + 1
         self.stats["hits"] = int(self.stats.get("hits", 0) or 0) + (1 if correct else 0)
         if correct:
@@ -1534,6 +1622,7 @@ class OnlineAIPredictor:
             "bootstrap_samples": int(self.stats.get("bootstrap_samples", 0) or 0),
             "bootstrap_wr": self.stats.get("bootstrap_wr"),
             "memory_contexts": len(self.memory),
+            "live_policy_contexts": len(self.live_policy),
             "risk_overrides": int(self.stats.get("risk_overrides", 0) or 0),
             "memory_overrides": int(self.stats.get("memory_overrides", 0) or 0),
             "top_experts": [(name, round(weight, 3)) for name, weight in top_experts],
@@ -1545,7 +1634,9 @@ class OnlineAIPredictor:
                 "AI_MEMORY_CORRECTED_V6",
                 "AI_DRAWDOWN_RECOVERY_V6",
                 "AI_DRAWDOWN_POLICY_V7",
+                "ONLINE_POLICY_LEARNED_V8",
                 "AI_ONLINE_DRAWDOWN_MEMORY_V7",
+                "ONLINE_WIN_LOSS_LEARNING",
                 "ONLINE_LOSS_LEARNING",
             ],
         }

@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v50-live-ahead-v7-strong-learning"
+VERSION = "v51-online-policy-learning"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
