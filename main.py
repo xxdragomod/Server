@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v52-telegram-besttime-command"
+VERSION = "v53-persistent-alltime-besttime"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -1337,86 +1337,165 @@ def build_daily_report(day=None):
 
 
 def build_besttime_report(day=None):
-    """Telegram /besttime: best and worst hours by actual settled results."""
+    """Telegram /besttime: today + all saved days best/worst time.
+
+    Uses persisted hourly_stats.json, so restart/band hone ke baad reset nahi hota.
+    """
     day = day or ist_today_str()
     with _hourly_lock:
-        hours = dict(_hourly_stats.get(day) or {})
-    rows = []
-    for hour in range(24):
-        bucket = hours.get(hour) or {"wins": 0, "losses": 0, "max_consec": 0}
+        all_days = {
+            str(d): {int(h): dict(v) for h, v in (day_map or {}).items()}
+            for d, day_map in (_hourly_stats or {}).items()
+        }
+
+    def make_row(hour, bucket, active_days=None):
         wins = int(bucket.get("wins", 0) or 0)
         losses = int(bucket.get("losses", 0) or 0)
         total = wins + losses
         if total <= 0:
-            continue
-        wr = wins / total
-        rows.append(
-            {
-                "hour": hour,
-                "wins": wins,
-                "losses": losses,
-                "total": total,
-                "wr": wr,
-                "max_consec": int(bucket.get("max_consec", 0) or 0),
-            }
-        )
-    if not rows:
-        return "🕐 DRAGO BEST TIME\n━━━━━━━━━━━━━━━━━━\nAaj abhi tak koi settled prediction data nahi hai."
+            return None
+        row = {
+            "hour": int(hour),
+            "wins": wins,
+            "losses": losses,
+            "total": total,
+            "wr": wins / total,
+            "loss_rate": losses / total,
+            "max_consec": int(bucket.get("max_consec", 0) or 0),
+        }
+        if active_days is not None:
+            row["active_days"] = int(active_days)
+            row["avg_losses_day"] = losses / max(1, int(active_days))
+        return row
 
-    enough = [r for r in rows if r["total"] >= HOURLY_MIN_SAMPLE] or rows
-    best_low_loss = min(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"], -r["total"]))
-    worst_high_loss = max(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"], r["total"]))
-    best_wr = max(enough, key=lambda r: (r["wr"], -r["losses"], -r["max_consec"], r["total"]))
-    worst_wr = min(enough, key=lambda r: (r["wr"], -r["losses"], r["max_consec"], -r["total"]))
+    def rows_for_day(target_day):
+        buckets = all_days.get(str(target_day)) or {}
+        out = []
+        for hour in range(24):
+            row = make_row(hour, buckets.get(hour) or {})
+            if row:
+                out.append(row)
+        return out
 
-    def fmt(row):
+    def aggregate_by_hour():
+        out = []
+        for hour in range(24):
+            wins = losses = max_consec = active_days = 0
+            for buckets in all_days.values():
+                bucket = buckets.get(hour) or {}
+                w = int(bucket.get("wins", 0) or 0)
+                l = int(bucket.get("losses", 0) or 0)
+                if w + l <= 0:
+                    continue
+                active_days += 1
+                wins += w
+                losses += l
+                max_consec = max(max_consec, int(bucket.get("max_consec", 0) or 0))
+            row = make_row(hour, {"wins": wins, "losses": losses, "max_consec": max_consec}, active_days=active_days)
+            if row:
+                out.append(row)
+        return out
+
+    def eligible(rows):
+        return [r for r in rows if r["total"] >= HOURLY_MIN_SAMPLE] or list(rows)
+
+    def pick(rows):
+        rows = eligible(rows)
+        if not rows:
+            return None
+        return {
+            "low_loss": min(rows, key=lambda r: (r["loss_rate"], r["max_consec"], r["losses"], -r["total"])),
+            "high_loss": max(rows, key=lambda r: (r["loss_rate"], r["max_consec"], r["losses"], r["total"])),
+            "best_wr": max(rows, key=lambda r: (r["wr"], -r["loss_rate"], -r["max_consec"], r["total"])),
+            "worst_wr": min(rows, key=lambda r: (r["wr"], -r["losses"], r["max_consec"], -r["total"])),
+            "safe3": sorted(rows, key=lambda r: (r["loss_rate"], r["max_consec"], r["losses"], -r["total"]))[:3],
+            "risky3": sorted(rows, key=lambda r: (r["loss_rate"], r["max_consec"], r["losses"], r["total"]), reverse=True)[:3],
+        }
+
+    def fmt(row, show_days=False):
+        extra = ""
+        if show_days:
+            extra = f" | Days {row.get('active_days', 0)} | AvgLoss/day {row.get('avg_losses_day', 0):.1f}"
         return (
-            f"{row['hour']:02d}:00-{row['hour']:02d}:59 | "
-            f"Bets {row['total']} | ✅ {row['wins']} | ❌ {row['losses']} | "
-            f"WR {row['wr'] * 100:.1f}% | MaxCL {row['max_consec']}"
+            f"{row['hour']:02d}:00-{row['hour']:02d}:59 | Bets {row['total']} | "
+            f"✅ {row['wins']} | ❌ {row['losses']} | WR {row['wr'] * 100:.1f}% | "
+            f"Loss {row['loss_rate'] * 100:.1f}% | MaxCL {row['max_consec']}" + extra
         )
 
-    top_loss_safe = sorted(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"]))[:3]
-    top_loss_risky = sorted(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"]), reverse=True)[:3]
-    total_bets = sum(r["total"] for r in rows)
-    total_losses = sum(r["losses"] for r in rows)
-    total_wins = sum(r["wins"] for r in rows)
-    note = ""
-    if not any(r["total"] >= HOURLY_MIN_SAMPLE for r in rows):
-        note = f"\n⚠️ Note: kisi hour me min sample {HOURLY_MIN_SAMPLE} bets nahi hua, available data se estimate hai."
+    today_rows = rows_for_day(day)
+    all_rows = aggregate_by_hour()
+    if not today_rows and not all_rows:
+        return (
+            "🕐 DRAGO BEST TIME\n━━━━━━━━━━━━━━━━━━\n"
+            "Abhi tak koi settled prediction data nahi hai. Data aate hi /besttime result dega."
+        )
+
     lines = [
         "🕐 DRAGO BEST TIME ANALYSIS",
         "━━━━━━━━━━━━━━━━━━",
-        f"📅 Date: {day} IST",
-        f"📊 Settled Bets: {total_bets} | ✅ {total_wins} | ❌ {total_losses}",
+        f"📅 Today: {day} IST",
+        f"💾 Persist: {HOURLY_STATS_FILE} (restart ke baad reset nahi)",
         f"🧠 AI Version: {pattern.VERSION}",
-        "",
-        "🟢 SABSE KAM LOSS WALA TIME",
-        fmt(best_low_loss),
-        "",
-        "🎯 BEST WIN-RATE TIME",
-        fmt(best_wr),
-        "",
-        "🔴 SABSE JYADA LOSS WALA TIME",
-        fmt(worst_high_loss),
-        "",
-        "⚠️ WEAKEST WIN-RATE TIME",
-        fmt(worst_wr),
-        "",
-        "✅ Top 3 low-loss hours:",
-        *[fmt(row) for row in top_loss_safe],
-        "",
-        "❌ Top 3 high-loss hours:",
-        *[fmt(row) for row in top_loss_risky],
     ]
-    if note:
-        lines.append(note)
+
+    if today_rows:
+        p = pick(today_rows)
+        total_bets = sum(r["total"] for r in today_rows)
+        total_losses = sum(r["losses"] for r in today_rows)
+        total_wins = sum(r["wins"] for r in today_rows)
+        lines += [
+            "",
+            "📌 AAJ KA RESULT",
+            f"📊 Bets {total_bets} | ✅ {total_wins} | ❌ {total_losses}",
+            "🟢 Aaj sabse kam loss:",
+            fmt(p["low_loss"]),
+            "🔴 Aaj sabse jyada loss:",
+            fmt(p["high_loss"]),
+            "🎯 Aaj best WR:",
+            fmt(p["best_wr"]),
+        ]
+        if not any(r["total"] >= HOURLY_MIN_SAMPLE for r in today_rows):
+            lines.append(f"⚠️ Aaj min sample {HOURLY_MIN_SAMPLE} bets/hour se kam hai; estimate samjho.")
+    else:
+        lines += ["", "📌 AAJ KA RESULT", "Aaj abhi tak settled prediction data nahi hai."]
+
+    if all_rows:
+        p_all = pick(all_rows)
+        saved_days = len([d for d, buckets in all_days.items() if any((int(b.get('wins', 0) or 0) + int(b.get('losses', 0) or 0)) > 0 for b in buckets.values())])
+        lines += [
+            "",
+            "📚 ALL SAVED DAYS / HAR DIN KA BEST TIME",
+            f"Saved days: {saved_days}",
+            "🟢 Overall sabse kam loss time:",
+            fmt(p_all["low_loss"], show_days=True),
+            "🔴 Overall sabse jyada loss time:",
+            fmt(p_all["high_loss"], show_days=True),
+            "🎯 Overall best WR time:",
+            fmt(p_all["best_wr"], show_days=True),
+            "",
+            "✅ Overall Top 3 safe hours:",
+            *[fmt(row, show_days=True) for row in p_all["safe3"]],
+            "",
+            "❌ Overall Top 3 risky hours:",
+            *[fmt(row, show_days=True) for row in p_all["risky3"]],
+        ]
+
+        day_lines = []
+        for d in sorted(all_days.keys(), reverse=True)[:7]:
+            rday = rows_for_day(d)
+            if not rday:
+                continue
+            best_day = pick(rday)["low_loss"]
+            day_lines.append(f"{d}: {best_day['hour']:02d}:00 | Bets {best_day['total']} | ❌ {best_day['losses']} | WR {best_day['wr'] * 100:.1f}%")
+        if day_lines:
+            lines += ["", "📆 Last saved days best hour:", *day_lines]
+
     lines += [
         "",
         "Command: /besttime",
         f"Updated: {ist_now().strftime('%d-%m-%Y %H:%M:%S')} IST",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines[:80])
 
 
 def telegram_command_loop():
