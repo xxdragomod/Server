@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v51-online-policy-learning"
+VERSION = "v52-telegram-besttime-command"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -117,9 +117,12 @@ TELEGRAM_BOT_TOKEN = (
 ).strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "6656009938").strip()
 TELEGRAM_LEVEL_ALERT_AT = int(os.getenv("TELEGRAM_LEVEL_ALERT_AT", "5") or 5)
+TELEGRAM_COMMANDS_ENABLED = (os.getenv("TELEGRAM_COMMANDS_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+TELEGRAM_POLL_SEC = int(os.getenv("TELEGRAM_POLL_SEC", "4") or 4)
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "21") or 21)
 SESSION_END_HOUR = int(os.getenv("SESSION_END_HOUR", "21") or 21)
 HOURLY_MIN_SAMPLE = int(os.getenv("HOURLY_MIN_SAMPLE", "10") or 10)
+HOURLY_STATS_FILE = os.getenv("HOURLY_STATS_FILE", "hourly_stats.json")
 
 LEVEL_CAP = int(os.getenv("LEVEL_CAP", "0") or 0)
 # Ultra-safe paper pause removed as requested. Server will keep real/autobet
@@ -143,6 +146,8 @@ _hourly_lock = threading.Lock()
 _draw_store = []
 _hourly_stats = {}
 _tg_last_level_alert = -1
+_telegram_update_offset = None
+_telegram_started_ts = int(time.time())
 _history_api_last_call_ts = 0.0
 _history_api_backoff_until = 0.0
 _live_api_last_call_ts = 0.0
@@ -204,15 +209,16 @@ def next_period(period):
     return f"{next_day.strftime('%Y%m%d')}{middle}0001"
 
 
-def telegram_send(text, silent=False):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def telegram_send(text, silent=False, chat_id=None):
+    target_chat = str(chat_id or TELEGRAM_CHAT_ID or "").strip()
+    if not TELEGRAM_BOT_TOKEN or not target_chat:
         log.warning("telegram not configured")
         return False
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": target_chat,
                 "text": str(text)[:3900],
                 "disable_notification": bool(silent),
             },
@@ -277,19 +283,77 @@ def telegram_recovery_alert(consec_before, level_before, period, method):
     )
 
 
+def _blank_hourly_day():
+    return {h: {"wins": 0, "losses": 0, "max_consec": 0} for h in range(24)}
+
+
+def load_hourly_stats():
+    global _hourly_stats
+    try:
+        if not os.path.exists(HOURLY_STATS_FILE):
+            return False
+        with open(HOURLY_STATS_FILE, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        source = raw.get("days", raw) if isinstance(raw, dict) else {}
+        parsed = {}
+        for day, buckets in (source or {}).items():
+            day_map = _blank_hourly_day()
+            for hour_key, value in (buckets or {}).items():
+                try:
+                    hour = int(hour_key)
+                except Exception:
+                    continue
+                if not 0 <= hour <= 23 or not isinstance(value, dict):
+                    continue
+                day_map[hour] = {
+                    "wins": int(value.get("wins", 0) or 0),
+                    "losses": int(value.get("losses", 0) or 0),
+                    "max_consec": int(value.get("max_consec", 0) or 0),
+                }
+            parsed[str(day)] = day_map
+        with _hourly_lock:
+            _hourly_stats = parsed
+        log.info("hourly stats loaded: days=%s file=%s", len(parsed), HOURLY_STATS_FILE)
+        return True
+    except Exception as exc:
+        log.warning("hourly stats load failed: %s", exc)
+        return False
+
+
+def save_hourly_stats():
+    try:
+        with _hourly_lock:
+            serial = {
+                day: {str(hour): bucket for hour, bucket in sorted(day_map.items())}
+                for day, day_map in _hourly_stats.items()
+            }
+        payload = {
+            "savedAt": datetime.now(timezone.utc).isoformat(),
+            "savedAtIst": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "days": serial,
+        }
+        tmp = HOURLY_STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, HOURLY_STATS_FILE)
+        return True
+    except Exception as exc:
+        log.warning("hourly stats save failed: %s", exc)
+        return False
+
+
 def record_hourly_result(correct, consec_after):
     now = ist_now()
     day, hour = now.strftime("%Y-%m-%d"), now.hour
     with _hourly_lock:
-        day_stats = _hourly_stats.setdefault(
-            day, {h: {"wins": 0, "losses": 0, "max_consec": 0} for h in range(24)}
-        )
+        day_stats = _hourly_stats.setdefault(day, _blank_hourly_day())
         bucket = day_stats[hour]
         bucket["wins" if correct else "losses"] += 1
         bucket["max_consec"] = max(bucket["max_consec"], int(consec_after))
+    save_hourly_stats()
 
 
-def fb_put(base, path, data, secret=""):
+def fb_put(base, path, data, secret=""): 
     if not base:
         return
     try:
@@ -1272,6 +1336,140 @@ def build_daily_report(day=None):
     return "\n".join(lines)
 
 
+def build_besttime_report(day=None):
+    """Telegram /besttime: best and worst hours by actual settled results."""
+    day = day or ist_today_str()
+    with _hourly_lock:
+        hours = dict(_hourly_stats.get(day) or {})
+    rows = []
+    for hour in range(24):
+        bucket = hours.get(hour) or {"wins": 0, "losses": 0, "max_consec": 0}
+        wins = int(bucket.get("wins", 0) or 0)
+        losses = int(bucket.get("losses", 0) or 0)
+        total = wins + losses
+        if total <= 0:
+            continue
+        wr = wins / total
+        rows.append(
+            {
+                "hour": hour,
+                "wins": wins,
+                "losses": losses,
+                "total": total,
+                "wr": wr,
+                "max_consec": int(bucket.get("max_consec", 0) or 0),
+            }
+        )
+    if not rows:
+        return "🕐 DRAGO BEST TIME\n━━━━━━━━━━━━━━━━━━\nAaj abhi tak koi settled prediction data nahi hai."
+
+    enough = [r for r in rows if r["total"] >= HOURLY_MIN_SAMPLE] or rows
+    best_low_loss = min(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"], -r["total"]))
+    worst_high_loss = max(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"], r["total"]))
+    best_wr = max(enough, key=lambda r: (r["wr"], -r["losses"], -r["max_consec"], r["total"]))
+    worst_wr = min(enough, key=lambda r: (r["wr"], -r["losses"], r["max_consec"], -r["total"]))
+
+    def fmt(row):
+        return (
+            f"{row['hour']:02d}:00-{row['hour']:02d}:59 | "
+            f"Bets {row['total']} | ✅ {row['wins']} | ❌ {row['losses']} | "
+            f"WR {row['wr'] * 100:.1f}% | MaxCL {row['max_consec']}"
+        )
+
+    top_loss_safe = sorted(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"]))[:3]
+    top_loss_risky = sorted(enough, key=lambda r: (r["losses"], r["max_consec"], -r["wr"]), reverse=True)[:3]
+    total_bets = sum(r["total"] for r in rows)
+    total_losses = sum(r["losses"] for r in rows)
+    total_wins = sum(r["wins"] for r in rows)
+    note = ""
+    if not any(r["total"] >= HOURLY_MIN_SAMPLE for r in rows):
+        note = f"\n⚠️ Note: kisi hour me min sample {HOURLY_MIN_SAMPLE} bets nahi hua, available data se estimate hai."
+    lines = [
+        "🕐 DRAGO BEST TIME ANALYSIS",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📅 Date: {day} IST",
+        f"📊 Settled Bets: {total_bets} | ✅ {total_wins} | ❌ {total_losses}",
+        f"🧠 AI Version: {pattern.VERSION}",
+        "",
+        "🟢 SABSE KAM LOSS WALA TIME",
+        fmt(best_low_loss),
+        "",
+        "🎯 BEST WIN-RATE TIME",
+        fmt(best_wr),
+        "",
+        "🔴 SABSE JYADA LOSS WALA TIME",
+        fmt(worst_high_loss),
+        "",
+        "⚠️ WEAKEST WIN-RATE TIME",
+        fmt(worst_wr),
+        "",
+        "✅ Top 3 low-loss hours:",
+        *[fmt(row) for row in top_loss_safe],
+        "",
+        "❌ Top 3 high-loss hours:",
+        *[fmt(row) for row in top_loss_risky],
+    ]
+    if note:
+        lines.append(note)
+    lines += [
+        "",
+        "Command: /besttime",
+        f"Updated: {ist_now().strftime('%d-%m-%Y %H:%M:%S')} IST",
+    ]
+    return "\n".join(lines)
+
+
+def telegram_command_loop():
+    global _telegram_update_offset
+    if not TELEGRAM_COMMANDS_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("telegram commands disabled or not configured")
+        return
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    allowed_chat = str(TELEGRAM_CHAT_ID).strip()
+    try:
+        # Skip old backlog when server starts.
+        response = requests.get(f"{base}/getUpdates", params={"timeout": 1, "limit": 1}, timeout=5)
+        if response.status_code == 200:
+            updates = response.json().get("result") or []
+            if updates:
+                _telegram_update_offset = int(updates[-1].get("update_id", 0)) + 1
+    except Exception as exc:
+        log.warning("telegram command init failed: %s", exc)
+    while True:
+        try:
+            params = {"timeout": 20, "limit": 20}
+            if _telegram_update_offset is not None:
+                params["offset"] = _telegram_update_offset
+            response = requests.get(f"{base}/getUpdates", params=params, timeout=30)
+            if response.status_code != 200:
+                log.warning("telegram getUpdates HTTP %s %s", response.status_code, response.text[:160])
+                time.sleep(max(3, TELEGRAM_POLL_SEC))
+                continue
+            for update in response.json().get("result") or []:
+                _telegram_update_offset = int(update.get("update_id", 0)) + 1
+                message = update.get("message") or update.get("edited_message") or {}
+                chat = message.get("chat") or {}
+                chat_id = str(chat.get("id") or "")
+                if chat_id != allowed_chat:
+                    continue
+                if int(message.get("date") or 0) < _telegram_started_ts - 30:
+                    continue
+                text = str(message.get("text") or "").strip()
+                command = text.split()[0].split("@", 1)[0].lower() if text else ""
+                if command == "/besttime":
+                    telegram_send(build_besttime_report(), chat_id=chat_id)
+                elif command in ("/report", "/dailyreport"):
+                    telegram_send(build_daily_report(), chat_id=chat_id)
+                elif command in ("/start", "/help"):
+                    telegram_send(
+                        "🐉 DRAGO AI Commands\n━━━━━━━━━━━━━━━━━━\n/besttime - sabse kam/jyada loss wala time\n/report - aaj ka daily report",
+                        chat_id=chat_id,
+                    )
+        except Exception as exc:
+            log.warning("telegram command loop error: %s", exc)
+            time.sleep(max(3, TELEGRAM_POLL_SEC))
+
+
 def daily_report_loop():
     last_sent = None
     while True:
@@ -1291,12 +1489,14 @@ def daily_report_loop():
 @asynccontextmanager
 async def lifespan(app):
     load_draw_store()
+    load_hourly_stats()
     ENGINE.loss.load_state()
     threads = (
         (poll_loop, "poll-30s-ai"),
         (render_keepalive_loop, "render-keepalive"),
         (midnight_cleanup_loop, "midnight"),
         (daily_report_loop, "daily-report"),
+        (telegram_command_loop, "telegram-commands"),
     )
     for target, name in threads:
         threading.Thread(target=target, daemon=True, name=name).start()
@@ -1404,6 +1604,12 @@ def wingo30s_json(limit: int = 100000):
     payload["limit"] = limit
     payload["file"] = DRAW_STORE_FILE
     return payload
+
+
+@app.get("/api/besttime")
+def api_besttime(request: Request):
+    require_vps_auth(request)
+    return {"success": True, "text": build_besttime_report(), "day": ist_today_str()}
 
 
 @app.get("/api/debug")

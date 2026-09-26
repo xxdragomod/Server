@@ -8,6 +8,7 @@ level_state.json
 wingo30s.json
 wingo30s_history.json
 mistakes.jsonl
+hourly_stats.json
 ai_model_state.json
 ai_analysis.json
 *.tmp
