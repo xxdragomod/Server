@@ -123,6 +123,7 @@ DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "21") or 21)
 SESSION_END_HOUR = int(os.getenv("SESSION_END_HOUR", "21") or 21)
 HOURLY_MIN_SAMPLE = int(os.getenv("HOURLY_MIN_SAMPLE", "10") or 10)
 HOURLY_STATS_FILE = os.getenv("HOURLY_STATS_FILE", "hourly_stats.json")
+HOURLY_STATS_FIREBASE_PATH = os.getenv("HOURLY_STATS_FIREBASE_PATH", f"runtime/{STREAM_ID}/hourly_stats")
 
 LEVEL_CAP = int(os.getenv("LEVEL_CAP", "0") or 0)
 # Ultra-safe paper pause removed as requested. Server will keep real/autobet
@@ -290,10 +291,17 @@ def _blank_hourly_day():
 def load_hourly_stats():
     global _hourly_stats
     try:
-        if not os.path.exists(HOURLY_STATS_FILE):
+        raw = None
+        source_name = ""
+        if os.path.exists(HOURLY_STATS_FILE):
+            with open(HOURLY_STATS_FILE, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            source_name = HOURLY_STATS_FILE
+        else:
+            raw = fb_get(FIREBASE_URL, HOURLY_STATS_FIREBASE_PATH, FIREBASE_SECRET)
+            source_name = f"firebase:{HOURLY_STATS_FIREBASE_PATH}" if raw else ""
+        if not raw:
             return False
-        with open(HOURLY_STATS_FILE, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
         source = raw.get("days", raw) if isinstance(raw, dict) else {}
         parsed = {}
         for day, buckets in (source or {}).items():
@@ -313,7 +321,9 @@ def load_hourly_stats():
             parsed[str(day)] = day_map
         with _hourly_lock:
             _hourly_stats = parsed
-        log.info("hourly stats loaded: days=%s file=%s", len(parsed), HOURLY_STATS_FILE)
+        log.info("hourly stats loaded: days=%s source=%s", len(parsed), source_name)
+        if source_name.startswith("firebase:"):
+            save_hourly_stats()
         return True
     except Exception as exc:
         log.warning("hourly stats load failed: %s", exc)
@@ -336,6 +346,10 @@ def save_hourly_stats():
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
         os.replace(tmp, HOURLY_STATS_FILE)
+        # Backup to Firebase too, so host/container redeploy wipe hone par bhi
+        # all-days /besttime data recover ho sake (if Firebase is configured).
+        if FIREBASE_URL and HOURLY_STATS_FIREBASE_PATH:
+            fb_put(FIREBASE_URL, HOURLY_STATS_FIREBASE_PATH, payload, FIREBASE_SECRET)
         return True
     except Exception as exc:
         log.warning("hourly stats save failed: %s", exc)
@@ -373,6 +387,21 @@ def fb_delete(base, path, secret=""):
         requests.delete(url, timeout=20)
     except Exception as exc:
         log.error("firebase DELETE error: %s", exc)
+
+
+def fb_get(base, path, secret=""):
+    if not base:
+        return None
+    try:
+        url = f"{base.rstrip('/')}/{path}.json" + (f"?auth={secret}" if secret else "")
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            log.warning("firebase GET %s -> %s %s", path, response.status_code, response.text[:160])
+            return None
+        return response.json()
+    except Exception as exc:
+        log.warning("firebase GET error: %s", exc)
+        return None
 
 
 def append_mistake(record):
