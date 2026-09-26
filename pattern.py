@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 NAME = "ai_ensemble"
-VERSION = "ai-v7.1-live-adaptive-drawdown"
+VERSION = "ai-v7.2-live-ahead-strong-learning"
 
 MIN_HISTORY = int(os.getenv("AI_MIN_HISTORY", "20") or 20)
 CONF_FLOOR = int(os.getenv("AI_CONF_FLOOR", "54") or 54)
@@ -583,6 +583,27 @@ _STATE_POLICY_V7_LIVE_DRAWDOWN = {
     (3, 'BSBBS', 5, 6, 1, 3, 6, 1): 'B',
     (3, 'SSBBS', 4, 5, 1, 4, 5, 0): 'B',
     (3, 'SSBBB', 6, 5, 3, 7, 7, 2): 'B',
+    # V7.2 live-ahead refresh seeds from latest live window.
+    (3, 'BBSSS', 6, 4, 3, 0, 3, 7): 'B',
+    (3, 'SBSSB', 5, 4, 1, 5, 0, 9): 'B',
+    (3, 'BBSSS', 5, 5, 3, 1, 4, 6): 'B',
+    (3, 'BBSSS', 5, 5, 3, 4, 0, 8): 'B',
+    (3, 'SSBBB', 5, 6, 3, 5, 5, 7): 'B',
+    (3, 'BBSSB', 5, 6, 1, 6, 4, 0): 'S',
+    (3, 'SBSBS', 5, 6, 1, 0, 5, 5): 'S',
+    (3, 'SBSBS', 5, 6, 1, 2, 8, 1): 'S',
+    (3, 'BBSSB', 5, 4, 1, 6, 1, 6): 'S',
+    (3, 'SBSSB', 5, 5, 1, 8, 3, 9): 'B',
+    (3, 'SSBBS', 4, 4, 1, 2, 7, 0): 'B',
+    (3, 'SBSBB', 7, 5, 2, 8, 5, 5): 'S',
+    (3, 'BBSSB', 6, 6, 1, 8, 2, 3): 'B',
+    (3, 'SSBBS', 4, 4, 1, 4, 7, 2): 'B',
+    (3, 'BBSSS', 4, 3, 3, 4, 4, 4): 'B',
+    (3, 'BBSSS', 6, 4, 3, 4, 0, 8): 'B',
+    (3, 'SBSSB', 6, 5, 1, 7, 2, 1): 'B',
+    (3, 'SSBBB', 4, 5, 3, 8, 8, 2): 'S',
+    (4, 'SBSSB', 4, 5, 1, 5, 0, 3): 'B',
+    (3, 'SBSSB', 6, 7, 1, 6, 3, 8): 'B',
 }
 
 class OnlineAIPredictor:
@@ -936,7 +957,7 @@ class OnlineAIPredictor:
     def _policy_memory_correction(self, p_big, policy_info, consec_loss=0):
         """After drawdown policy picks a side, live memory can veto repeated mistakes."""
         if (os.getenv("AI_POLICY_MEMORY_CORRECTION", "0") or "0").strip().lower() not in ("1", "true", "yes", "y", "on"):
-            return _clamp(p_big, 0.06, 0.94), {"override": False, "keys_checked": 0, "reason": "disabled_shadow_learning"}
+            return _clamp(p_big, 0.06, 0.94), {"override": False, "keys_checked": 0, "reason": "shadow_learning_only_safe_default"}
         cl = int(consec_loss or 0)
         if cl < 3:
             return _clamp(p_big, 0.06, 0.94), {"override": False, "keys_checked": 0, "reason": "cl_lt_3"}
@@ -956,7 +977,11 @@ class OnlineAIPredictor:
                 continue
             loss_rate = side_losses / side_bets
             exact_key = key.startswith("POL_HIGH_KEY") or key.startswith("POL_EMERGENCY_KEY")
-            ok = (exact_key and side_losses >= 1 and loss_rate >= 0.99) or (side_losses >= 2 and loss_rate >= 0.66)
+            ok = (
+                (exact_key and cl >= 4 and side_losses >= 1 and loss_rate >= 0.99)
+                or (exact_key and side_losses >= 2 and loss_rate >= 0.80)
+                or (side_losses >= 3 and loss_rate >= 0.66)
+            )
             if not ok:
                 continue
             score = loss_rate + min(cl, 8) * 0.05 + min(side_losses, 6) * 0.03
@@ -1376,10 +1401,10 @@ class OnlineAIPredictor:
         prediction = self.last_prediction
         correct = prediction.get("side") == actual_side
         target = label_from_side(actual_side)
-        # More learning after a loss, but less aggressive than v1 to avoid
-        # overfitting/overconfidence. High CL still gets extra passes.
-        steps = 1 if correct else max(3, min(7, int(loss_boost or 3)))
-        weight = 1.0 if correct else 1.45
+        # Stronger live learning: every loss gets several SGD passes, and higher
+        # drawdown gets heavier correction so the model adapts while it runs.
+        steps = 1 if correct else max(5, min(12, int(loss_boost or 5)))
+        weight = 1.0 if correct else min(2.35, 1.55 + 0.06 * steps)
         losses = []
         for _ in range(steps):
             loss, _p = self.model.train(prediction["features"], target, weight=weight)

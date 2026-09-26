@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v49-ai-v7-force-bootstrap-learning"
+VERSION = "v50-live-ahead-v7-strong-learning"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -59,12 +59,16 @@ HISTORY_API_URL = (
     or DEFAULT_DRAGO_HISTORY_API_URL
 ).strip()
 HISTORY_FALLBACK_URLS = (os.getenv("HISTORY_FALLBACK_URLS") or DEFAULT_DIRECT_HISTORY_API_URL).strip()
+# Separate fast live source for polling. Bootstrap can use 10K DRAGO history,
+# but live prediction must not wait 28s for that source or prediction appears 1 period behind.
+LIVE_HISTORY_API_URL = (os.getenv("LIVE_HISTORY_API_URL") or DEFAULT_DIRECT_HISTORY_API_URL).strip()
+LIVE_HISTORY_FALLBACK_URLS = (os.getenv("LIVE_HISTORY_FALLBACK_URLS") or "").strip()
 HISTORY_API_KEY = os.getenv(
     "HISTORY_API_KEY",
     "drago_d5b31311d951cec50aa1894ef614ebc73c039e0bacaf44c8",
 ).strip()
 BOOTSTRAP_HISTORY_LIMIT = int(os.getenv("BOOTSTRAP_HISTORY_LIMIT", "10000") or 10000)
-POLL_HISTORY_LIMIT = int(os.getenv("POLL_HISTORY_LIMIT", "200") or 200)
+POLL_HISTORY_LIMIT = int(os.getenv("POLL_HISTORY_LIMIT", "20") or 20)
 POLL_SEC = int(os.getenv("POLL_SEC", "3") or 3)
 HISTORY_MAX = int(os.getenv("HISTORY_MAX", "5000") or 5000)
 DRAW_STORE_MAX = int(os.getenv("DRAW_STORE_MAX", "100000") or 100000)
@@ -81,9 +85,10 @@ _AI_BOOTSTRAP_EPOCHS_RAW = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "1") or 1)
 # Even if an old .env still has AI_BOOTSTRAP_EPOCHS=0, train once by default.
 # Use AI_DISABLE_BOOTSTRAP_TRAIN=1 only if you intentionally want no startup training.
 AI_BOOTSTRAP_EPOCHS = 0 if AI_DISABLE_BOOTSTRAP_TRAIN else max(1, _AI_BOOTSTRAP_EPOCHS_RAW)
-AI_BOOTSTRAP_TRAIN_LIMIT = int(os.getenv("AI_BOOTSTRAP_TRAIN_LIMIT", "1500") or 1500)
+AI_BOOTSTRAP_TRAIN_LIMIT = int(os.getenv("AI_BOOTSTRAP_TRAIN_LIMIT", "2500") or 2500)
 AI_RESET_ON_BOOT = (os.getenv("AI_RESET_ON_BOOT", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
-HISTORY_API_MIN_INTERVAL_SEC = int(os.getenv("HISTORY_API_MIN_INTERVAL_SEC", "28") or 28)
+HISTORY_API_MIN_INTERVAL_SEC = int(os.getenv("HISTORY_API_MIN_INTERVAL_SEC", "60") or 60)
+LIVE_HISTORY_MIN_INTERVAL_SEC = int(os.getenv("LIVE_HISTORY_MIN_INTERVAL_SEC", "5") or 5)
 HISTORY_API_BACKOFF_SEC = int(os.getenv("HISTORY_API_BACKOFF_SEC", "300") or 300)
 # Fake/clock fallback is OFF by default. A new prediction is published only when
 # a real fresh draw is received from the history source. Set CLOCK_FALLBACK_ENABLE=1
@@ -140,6 +145,8 @@ _hourly_stats = {}
 _tg_last_level_alert = -1
 _history_api_last_call_ts = 0.0
 _history_api_backoff_until = 0.0
+_live_api_last_call_ts = 0.0
+_live_api_backoff_until = 0.0
 
 DATA_SOURCE = {
     "ok": None,
@@ -620,9 +627,13 @@ def _safe_url(url):
     return str(url)
 
 
-def _history_source_urls():
+def _history_source_urls(live_only=False):
     urls = []
-    for raw in [HISTORY_API_URL, *(HISTORY_FALLBACK_URLS.split(",") if HISTORY_FALLBACK_URLS else [])]:
+    if live_only:
+        raw_sources = [LIVE_HISTORY_API_URL, *(LIVE_HISTORY_FALLBACK_URLS.split(",") if LIVE_HISTORY_FALLBACK_URLS else [])]
+    else:
+        raw_sources = [HISTORY_API_URL, *(HISTORY_FALLBACK_URLS.split(",") if HISTORY_FALLBACK_URLS else [])]
+    for raw in raw_sources:
         url = str(raw or "").strip()
         if url and url not in urls:
             urls.append(url)
@@ -648,11 +659,12 @@ def _api_params(url, limit):
 def _api_headers(url):
     host = (urlparse(url).netloc or "").lower()
     if "ar-lottery" in host:
+        origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
         return {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
-            "Referer": "https://draw.ar-lottery01.com/",
-            "Origin": "https://draw.ar-lottery01.com",
+            "Referer": origin + "/",
+            "Origin": origin,
             "Cache-Control": "no-cache",
         }
     return {"User-Agent": "DRAGO-AI-Server/4.0", "Accept": "application/json"}
@@ -698,29 +710,40 @@ def _fetch_one_history_source(url, limit):
         return [], None, str(exc)[:180], {}
 
 
-def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
-    global _history_api_last_call_ts, _history_api_backoff_until
+def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False, live_only=False):
+    global _history_api_last_call_ts, _history_api_backoff_until, _live_api_last_call_ts, _live_api_backoff_until
     now_ts = time.time()
+    mode = "live_poll" if live_only else "history_bootstrap"
+    min_interval = LIVE_HISTORY_MIN_INTERVAL_SEC if live_only else HISTORY_API_MIN_INTERVAL_SEC
+    last_call = _live_api_last_call_ts if live_only else _history_api_last_call_ts
+    backoff_until = _live_api_backoff_until if live_only else _history_api_backoff_until
     if not force:
-        if now_ts < _history_api_backoff_until:
+        if now_ts < backoff_until:
             DATA_SOURCE["throttled"] = True
-            DATA_SOURCE["error"] = "history API backoff active"
-            DATA_SOURCE["next_allowed_in_sec"] = round(_history_api_backoff_until - now_ts, 1)
+            DATA_SOURCE["mode"] = mode
+            DATA_SOURCE["error"] = f"{mode} backoff active"
+            DATA_SOURCE["next_allowed_in_sec"] = round(backoff_until - now_ts, 1)
             return None
-        wait_left = HISTORY_API_MIN_INTERVAL_SEC - (now_ts - _history_api_last_call_ts)
+        wait_left = min_interval - (now_ts - last_call)
         if wait_left > 0:
             DATA_SOURCE["throttled"] = True
-            DATA_SOURCE["error"] = "waiting for next allowed history API poll"
+            DATA_SOURCE["mode"] = mode
+            DATA_SOURCE["error"] = f"waiting for next allowed {mode} poll"
             DATA_SOURCE["next_allowed_in_sec"] = round(wait_left, 1)
             return None
-    _history_api_last_call_ts = now_ts
+    if live_only:
+        _live_api_last_call_ts = now_ts
+    else:
+        _history_api_last_call_ts = now_ts
     DATA_SOURCE["throttled"] = False
+    DATA_SOURCE["mode"] = mode
     DATA_SOURCE["next_allowed_in_sec"] = 0
 
     attempts = []
     merged = {}
     freshest = None
-    for url in _history_source_urls():
+    source_urls = _history_source_urls(live_only=live_only)
+    for url in source_urls:
         records, status, error, payload = _fetch_one_history_source(url, limit)
         latest_period = records[-1]["period"] if records else ""
         safe = _safe_url(url)
@@ -744,10 +767,11 @@ def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
             }
 
     DATA_SOURCE["attempts"] = attempts[-5:]
-    DATA_SOURCE["sources"] = [_safe_url(u) for u in _history_source_urls()]
+    DATA_SOURCE["sources"] = [_safe_url(u) for u in source_urls]
     if merged and freshest:
         combined = [merged[k] for k in sorted(merged, key=period_sort_key)]
         _update_data_source(True, freshest["status"], "")
+        DATA_SOURCE["mode"] = mode
         DATA_SOURCE["source"] = freshest["source"]
         DATA_SOURCE["count"] = len(combined)
         DATA_SOURCE["limit"] = int(limit)
@@ -760,13 +784,18 @@ def fetch_history_api(limit=BOOTSTRAP_HISTORY_LIMIT, force=False):
     )[:240] or "no history source configured"
     last_status = attempts[-1].get("http_status") if attempts else None
     _update_data_source(False, last_status, error_text)
+    DATA_SOURCE["mode"] = mode
     bad_statuses = {a.get("http_status") for a in attempts}
     if bad_statuses.intersection({402, 403, 429, 500, 502, 503, 504}):
-        _history_api_backoff_until = time.time() + HISTORY_API_BACKOFF_SEC
-        backoff_until = ist_now() + timedelta(seconds=HISTORY_API_BACKOFF_SEC)
-        DATA_SOURCE["backoff_until_ist"] = backoff_until.strftime("%Y-%m-%d %H:%M:%S")
+        new_backoff = time.time() + HISTORY_API_BACKOFF_SEC
+        if live_only:
+            _live_api_backoff_until = new_backoff
+        else:
+            _history_api_backoff_until = new_backoff
+        backoff_until_ist = ist_now() + timedelta(seconds=HISTORY_API_BACKOFF_SEC)
+        DATA_SOURCE["backoff_until_ist"] = backoff_until_ist.strftime("%Y-%m-%d %H:%M:%S")
         DATA_SOURCE["backoff_sec"] = HISTORY_API_BACKOFF_SEC
-    log.warning("history sources failed: %s", error_text)
+    log.warning("%s sources failed: %s", mode, error_text)
     return []
 
 
@@ -884,8 +913,9 @@ class Engine:
         correct = predicted == actual
         level_before = self.loss.level
         consec_before = self.loss.consec_losses
-        # Loss gets stronger training weight. Example: L5/L6 losses cause more SGD passes.
-        loss_boost = 1 if correct else min(10, max(3, consec_before + 3))
+        # Loss gets stronger training weight. Example: L4+ losses cause many more
+        # SGD passes so the live model corrects itself faster while it runs.
+        loss_boost = 1 if correct else min(16, max(5, consec_before + 5))
         learning_report = pattern.learn_from_actual(
             actual,
             actual_number=number,
@@ -1135,7 +1165,9 @@ def tick():
         if not ENGINE.bootstrap_from_api():
             time.sleep(min(10, POLL_SEC))
         return
-    records = fetch_history_api(POLL_HISTORY_LIMIT, force=False)
+    # Fast live-only poll keeps prediction one period AHEAD. Bootstrap/resync can
+    # use the heavy 10K source; live loop uses direct fresh source every few sec.
+    records = fetch_history_api(POLL_HISTORY_LIMIT, force=False, live_only=True)
     # None means intentionally skipped due to throttle/backoff; do nothing.
     if records is None:
         return
@@ -1436,10 +1468,13 @@ def source_status(request: Request):
         "clock_fallback_count": ENGINE.clock_fallback_count,
         "real_source_required": not CLOCK_FALLBACK_ENABLE,
         "source_urls": [_safe_url(u) for u in _history_source_urls()],
+        "live_source_urls": [_safe_url(u) for u in _history_source_urls(live_only=True)],
         "draw_store_files": _draw_store_files(),
         "draw_store_count": len(load_draw_store()),
         "draw_store_max": DRAW_STORE_MAX,
         "history_api_min_interval_sec": HISTORY_API_MIN_INTERVAL_SEC,
+        "live_history_min_interval_sec": LIVE_HISTORY_MIN_INTERVAL_SEC,
+        "poll_history_limit": POLL_HISTORY_LIMIT,
         "history_api_backoff_sec": HISTORY_API_BACKOFF_SEC,
     }
 
