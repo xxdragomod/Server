@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 NAME = "ai_ensemble"
-VERSION = "ai-v9-loss-analyzer-policy"
+VERSION = "ai-v10-real-neural-loss-brain"
 
 MIN_HISTORY = int(os.getenv("AI_MIN_HISTORY", "20") or 20)
 CONF_FLOOR = int(os.getenv("AI_CONF_FLOOR", "54") or 54)
@@ -670,7 +670,14 @@ _STATE_POLICY_V9_LIVE_DRAWDOWN = {
 
 class OnlineAIPredictor:
     def __init__(self):
-        self.model = TinyNeuralNet()
+        # Multi-speed online neural brain:
+        # - main_model learns the stable signal,
+        # - fast_model reacts quickly after fresh wins/losses,
+        # - slow_model preserves longer-term behaviour so one random round cannot
+        #   destroy the model. All three are trained after every settled result.
+        self.model = TinyNeuralNet(seed=1337)
+        self.fast_model = TinyNeuralNet(hidden_size=max(12, _HIDDEN // 2), lr=_LEARNING_RATE * 1.85, seed=4242)
+        self.slow_model = TinyNeuralNet(hidden_size=_HIDDEN, lr=_LEARNING_RATE * 0.45, seed=2026)
         # Generalized learned memory. This is NOT a fixed guard table; keys are
         # created from live/backtest outcomes and updated after settlement.
         self.memory = {}
@@ -689,6 +696,8 @@ class OnlineAIPredictor:
             "loaded_state": False,
             "risk_overrides": 0,
             "memory_overrides": 0,
+            "loss_brain_overrides": 0,
+            "loss_causes": {},
         }
         self.last_prediction = None
         self.last_analysis = None
@@ -696,11 +705,18 @@ class OnlineAIPredictor:
         # This makes the drawdown layer adapt from both wins and losses instead
         # of relying only on embedded seed states.
         self.live_policy = {}
+        # V10 loss brain = generalized online memory over loss-streak states.
+        # It learns WHY a streak happened (state, side, digit/color context) and
+        # can override future high-risk states when enough live evidence exists.
+        self.loss_brain = {}
         self._bulk_training = False
 
     def _default_expert_weights(self):
         return {
-            "NN": 1.20,
+            "NN": 1.05,
+            "NN_MAIN": 0.78,
+            "NN_FAST": 0.70,
+            "NN_SLOW": 0.62,
             "MARKOV2": 1.00,
             "MARKOV3": 1.00,
             "MARKOV4": 0.85,
@@ -728,8 +744,11 @@ class OnlineAIPredictor:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             self.model.load_dict(data.get("model") or {})
+            self.fast_model.load_dict(data.get("fast_model") or {})
+            self.slow_model.load_dict(data.get("slow_model") or {})
             self.memory = data.get("memory") or {}
             self.live_policy = data.get("live_policy") or {}
+            self.loss_brain = data.get("loss_brain") or {}
             weights = data.get("expert_weights") or {}
             defaults = self._default_expert_weights()
             defaults.update({k: float(v) for k, v in weights.items() if k in defaults})
@@ -741,9 +760,12 @@ class OnlineAIPredictor:
             self.mistakes = deque(data.get("mistakes") or [], maxlen=200)
             self.stats["loaded_state"] = True
             log.info(
-                "AI ensemble state loaded: samples=%s memory=%s experts=%s",
+                "AI ensemble state loaded: samples=%s/%s/%s memory=%s loss_brain=%s experts=%s",
                 self.model.trained_samples,
+                self.fast_model.trained_samples,
+                self.slow_model.trained_samples,
                 len(self.memory),
+                len(self.loss_brain),
                 len(self.expert_weights),
             )
             return True
@@ -766,12 +788,26 @@ class OnlineAIPredictor:
                     reverse=True,
                 )[:MEMORY_MAX]
                 self.memory = dict(items)
+            if len(self.loss_brain) > MEMORY_MAX:
+                items = sorted(
+                    self.loss_brain.items(),
+                    key=lambda kv: (
+                        float(kv[1].get("last_seen", 0) or 0),
+                        int(kv[1].get("bets", 0) or 0),
+                        abs(float((kv[1].get("score") or {}).get("B", 0) or 0) - float((kv[1].get("score") or {}).get("S", 0) or 0)),
+                    ),
+                    reverse=True,
+                )[:MEMORY_MAX]
+                self.loss_brain = dict(items)
             payload = {
                 "version": VERSION,
                 "saved_at": time.time(),
                 "model": self.model.to_dict(),
+                "fast_model": self.fast_model.to_dict(),
+                "slow_model": self.slow_model.to_dict(),
                 "memory": self.memory,
                 "live_policy": self.live_policy,
+                "loss_brain": self.loss_brain,
                 "expert_weights": self.expert_weights,
                 "expert_recent": self.expert_recent,
                 "stats": self.stats,
@@ -927,7 +963,7 @@ class OnlineAIPredictor:
             edge = abs(p - 0.5) * 2.0
             w = base_w * (0.45 + edge)
             # Drawdown mode: reduce NN dominance and increase interpretable/context experts.
-            if cl >= 3 and name == "NN":
+            if cl >= 3 and name.startswith("NN"):
                 w *= 0.70
             if cl >= 3 and name in ("STREAK_CONT", "STREAK_BREAK", "MARKOV2", "MARKOV3", "DIGIT1", "BALANCE20"):
                 w *= 1.25 + min(cl, 8) * 0.04
@@ -1008,6 +1044,155 @@ class OnlineAIPredictor:
         if bets < 2 or max(b_score, s_score) < 4.0 or abs(b_score - s_score) < 2.0:
             return None, rec
         return ("B" if b_score > s_score else "S"), rec
+
+    def _loss_brain_keys(self, policy_info):
+        """Generalized keys for V10 online loss-streak brain.
+
+        These keys deliberately avoid fixed period guards. They combine current
+        level pressure, last BIG/SMALL shape, recent balance, digits and coarse
+        state so repeated failure causes can be learned live.
+        """
+        if not isinstance(policy_info, dict):
+            return []
+        cl = int(policy_info.get("cl", 0) or 0)
+        high = policy_info.get("high_key")
+        state = policy_info.get("state_key")
+        keys = []
+        def add(name, value, weight):
+            if value is None:
+                return
+            if isinstance(value, list):
+                value = tuple(value)
+            keys.append((f"LB:{name}:{repr(value)}", float(weight)))
+        add("EXACT", high, 1.00)
+        if isinstance(high, list):
+            high = tuple(high)
+        if isinstance(high, tuple) and len(high) >= 8:
+            cl_cap, last5, b10, b20bin, run_n, last_num, prev_num, seq10 = high[:8]
+            add("COARSE", (min(cl, 8), last5, b10, b20bin, run_n), 0.48)
+            add("DIGITS", (min(cl, 8), last5, last_num, prev_num), 0.34)
+            add("SEQ", (min(cl, 8), last5, seq10), 0.26)
+            add("SHAPE", (min(cl, 8), last5, b10, b20bin), 0.32)
+        add("STATE", state, 0.42)
+        last5 = policy_info.get("last5")
+        if last5:
+            add("LAST5", (min(cl, 8), last5), 0.24)
+        return keys
+
+    def _loss_brain_side(self, policy_info):
+        """Return a learned side from live win/loss evidence, if strong enough."""
+        cl = int((policy_info or {}).get("cl", 0) or 0)
+        if cl < 2:
+            return None, {"override": False, "reason": "cl_lt_2"}
+        total_b = total_s = 0.0
+        evidence = 0.0
+        used = []
+        for key, weight in self._loss_brain_keys(policy_info):
+            rec = self.loss_brain.get(key)
+            if not isinstance(rec, dict):
+                continue
+            bets = int(rec.get("bets", 0) or 0)
+            if bets <= 0:
+                continue
+            exact = key.startswith("LB:EXACT")
+            threshold = 1 if (exact and cl >= 3) else (2 if cl >= 4 else 4)
+            if bets < threshold:
+                continue
+            scores = rec.get("score") or {}
+            b_score = float(scores.get("B", 0) or 0)
+            s_score = float(scores.get("S", 0) or 0)
+            scale = weight * min(1.0, bets / 8.0) * (1.0 + min(cl, 8) * 0.08)
+            total_b += b_score * scale
+            total_s += s_score * scale
+            evidence += bets * weight
+            used.append({
+                "key": key[:90],
+                "bets": bets,
+                "wins": int(rec.get("wins", 0) or 0),
+                "losses": int(rec.get("losses", 0) or 0),
+                "b_score": round(b_score, 2),
+                "s_score": round(s_score, 2),
+                "weight": round(weight, 2),
+            })
+        diff = total_b - total_s
+        min_diff = 2.8 if cl >= 4 else 3.6
+        if evidence >= 1.0 and abs(diff) >= min_diff:
+            side = "B" if diff > 0 else "S"
+            return side, {
+                "override": True,
+                "side": side,
+                "diff": round(diff, 3),
+                "evidence": round(evidence, 2),
+                "contexts": used[:6],
+            }
+        return None, {"override": False, "diff": round(diff, 3), "evidence": round(evidence, 2), "contexts": used[:4]}
+
+    def _update_loss_brain(self, prediction, actual_side, correct=False):
+        """Train the V10 loss brain from both WIN and LOSS settlements."""
+        policy = prediction.get("policy") or {}
+        if actual_side not in ("B", "S") or not policy.get("active"):
+            return
+        predicted = prediction.get("side") if prediction.get("side") in ("B", "S") else None
+        cl = int(policy.get("cl", 0) or 0)
+        now = time.time()
+        for key, weight in self._loss_brain_keys(policy):
+            rec = self.loss_brain.setdefault(
+                key,
+                {
+                    "bets": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "score": {"B": 0.0, "S": 0.0},
+                    "actual": {"B": 0, "S": 0},
+                    "pred": {"B": 0, "S": 0},
+                    "last_seen": 0.0,
+                },
+            )
+            rec["bets"] = int(rec.get("bets", 0) or 0) + 1
+            rec["wins"] = int(rec.get("wins", 0) or 0) + (1 if correct else 0)
+            rec["losses"] = int(rec.get("losses", 0) or 0) + (0 if correct else 1)
+            rec.setdefault("actual", {"B": 0, "S": 0})[actual_side] = int(rec.get("actual", {}).get(actual_side, 0) or 0) + 1
+            if predicted in ("B", "S"):
+                rec.setdefault("pred", {"B": 0, "S": 0})[predicted] = int(rec.get("pred", {}).get(predicted, 0) or 0) + 1
+            score = rec.setdefault("score", {"B": 0.0, "S": 0.0})
+            if correct:
+                gain = (1.0 + min(cl, 8) * 0.05) * weight
+                score[actual_side] = float(score.get(actual_side, 0) or 0) + gain
+                score[opposite(actual_side)] = float(score.get(opposite(actual_side), 0) or 0) * 0.992
+            else:
+                # Losses get stronger correction; this is what teaches the model
+                # why a long streak is forming and which side would have saved it.
+                gain = (3.2 + min(cl, 8) * 0.28) * weight
+                score[actual_side] = float(score.get(actual_side, 0) or 0) + gain
+                if predicted in ("B", "S"):
+                    score[predicted] = float(score.get(predicted, 0) or 0) - (1.55 + min(cl, 8) * 0.12) * weight
+            rec["side"] = "B" if float(score.get("B", 0) or 0) >= float(score.get("S", 0) or 0) else "S"
+            rec["last_seen"] = now
+        if len(self.loss_brain) > 1500:
+            items = sorted(self.loss_brain.items(), key=lambda kv: float(kv[1].get("last_seen", 0) or 0), reverse=True)[:1200]
+            self.loss_brain = dict(items)
+
+    def _diagnose_result(self, prediction, actual_side, correct=False):
+        if correct:
+            return "win_reinforced_context"
+        predicted = prediction.get("side")
+        source = str(prediction.get("source") or "")
+        p_big = float(prediction.get("prob_big", 0.5) or 0.5)
+        p_nn = float(prediction.get("nn_prob_big", 0.5) or 0.5)
+        neural_side = "B" if p_nn >= 0.5 else "S"
+        recent_same = 0
+        for m in list(self.mistakes)[:6]:
+            if m.get("predicted") == predicted:
+                recent_same += 1
+        if neural_side == actual_side and predicted != actual_side:
+            return "policy_overrode_neural_side"
+        if recent_same >= 2:
+            return "repeated_failed_side_trap"
+        if source.startswith("AI_DRAWDOWN_POLICY") or source.startswith("ONLINE_POLICY"):
+            return "drawdown_state_policy_miss"
+        if abs(p_big - 0.5) < 0.08:
+            return "low_edge_random_zone"
+        return "context_shift_unseen_state"
 
     def _update_live_policy(self, prediction, actual_side, correct=False):
         """Online policy learner updated on BOTH wins and losses.
@@ -1292,10 +1477,22 @@ class OnlineAIPredictor:
                 seq % 100,
             )
             live_side, live_rec = self._live_policy_side(high_key)
+            loss_brain_side, loss_brain_info = self._loss_brain_side({
+                "active": True,
+                "state_key": state_key,
+                "high_key": high_key,
+                "emergency_key": emergency_key,
+                "cl": cl,
+                "last5": "".join(last5),
+            })
             if cl >= 3 and live_side in ("B", "S"):
                 side = live_side
                 expert_name = f"online_policy_{side}"
                 phase = "ONLINE_POLICY_LEARNED_V8"
+            elif cl >= 3 and loss_brain_side in ("B", "S"):
+                side = loss_brain_side
+                expert_name = f"neural_loss_brain_{side}"
+                phase = "NEURAL_LOSS_BRAIN_V10"
             elif cl >= 3 and high_key in _STATE_POLICY_V9_LIVE_DRAWDOWN:
                 side = _STATE_POLICY_V9_LIVE_DRAWDOWN[high_key]
                 expert_name = f"v9_loss_analyzer_{side}"
@@ -1323,6 +1520,7 @@ class OnlineAIPredictor:
             "high_key": locals().get("high_key"),
             "emergency_key": locals().get("emergency_key"),
             "live_policy": locals().get("live_rec"),
+            "loss_brain": locals().get("loss_brain_info"),
             "cl": cl,
             "last5": "".join(last5),
             "last10": "".join(last10),
@@ -1341,7 +1539,7 @@ class OnlineAIPredictor:
         if cl < 3:
             return _clamp(p_big, 0.04, 0.96), {"active": False}
         # Rule/context ensemble without NN for recovery situations.
-        rule_votes = {k: v for k, v in votes.items() if k != "NN"}
+        rule_votes = {k: v for k, v in votes.items() if not k.startswith("NN")}
         p_rule, rule_meta = self._combine_votes(rule_votes, consec_loss=cl)
         blend = min(0.78, 0.18 + (cl - 3) * 0.10)
         adjusted = p_big * (1.0 - blend) + p_rule * blend
@@ -1403,9 +1601,18 @@ class OnlineAIPredictor:
     def predict(self, history, event_id=None, numbers=None, colors=None, consec_losses=0, save=True):
         hist, nums, cols = _align_inputs(history, numbers, colors)
         x, summary = build_features(hist, nums, cols, event_id, consec_losses)
-        p_nn = self.model.forward(x)
+        p_main = self.model.forward(x)
+        p_fast = self.fast_model.forward(x)
+        p_slow = self.slow_model.forward(x)
+        # Three neural heads are fused before expert voting. Fast adapts to fresh
+        # live outcomes, slow stabilizes against random one-round noise.
+        p_nn = _clamp((0.58 * p_main) + (0.27 * p_fast) + (0.15 * p_slow), 0.02, 0.98)
         votes, expert_info = self._expert_votes(hist, nums, cols, event_id, p_nn)
+        votes["NN_MAIN"] = p_main
+        votes["NN_FAST"] = p_fast
+        votes["NN_SLOW"] = p_slow
         p_big, ensemble_info = self._combine_votes(votes, consec_loss=consec_losses)
+        p_ensemble_after_learning = p_big
         source = "AI_ENSEMBLE_V6"
         keys = self._memory_keys(hist, nums, cols, summary, consec_losses)
         if len(hist) >= MIN_HISTORY:
@@ -1422,18 +1629,53 @@ class OnlineAIPredictor:
                 self.stats["risk_overrides"] = int(self.stats.get("risk_overrides", 0) or 0) + 1
         if memory_info.get("override"):
             self.stats["memory_overrides"] = int(self.stats.get("memory_overrides", 0) or 0) + 1
+        p_ensemble_after_learning = p_big
 
         # Final anti-drawdown policy layer. It was selected by walk-forward
         # optimization for lower max loss streak; the NN/ensemble still learns
         # in the background and supplies diagnostics.
         policy_info = self._drawdown_policy(hist, nums, consec_losses, event_id=event_id)
         policy_memory_info = {"override": False}
+        neural_override_info = {"override": False}
         if policy_info.get("active"):
-            p_big = float(policy_info["p_big"])
-            source = "ONLINE_POLICY_LEARNED_V8" if policy_info.get("phase") == "ONLINE_POLICY_LEARNED_V8" else "AI_DRAWDOWN_POLICY_V9"
+            policy_p = float(policy_info["p_big"])
+            # The neural brain is not ignored: blend its current belief with the
+            # drawdown controller. The policy side still protects high-risk CL,
+            # while neural heads can influence normal rounds and confidence.
+            cl_now = int(consec_losses or 0)
+            neural_blend = 0.18 if cl_now < 3 else 0.08
+            p_big = _clamp((policy_p * (1.0 - neural_blend)) + (p_ensemble_after_learning * neural_blend), 0.06, 0.94)
+            policy_side = "B" if policy_p >= 0.5 else "S"
+            neural_side = "B" if p_ensemble_after_learning >= 0.5 else "S"
+            neural_edge = abs(p_ensemble_after_learning - 0.5)
+            # Neural side override is kept behind an env switch because fresh
+            # testing showed unrestricted neural flips can increase drawdown.
+            # By default the neural heads train/use shadow score while the
+            # tested drawdown controller protects long streaks.
+            neural_threshold = 0.11 if cl_now == 0 else (0.14 if cl_now == 1 else 0.17)
+            neural_side_override_enabled = (os.getenv("AI_NEURAL_SIDE_OVERRIDE", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+            if neural_side_override_enabled and cl_now < 3 and neural_side != policy_side and neural_edge >= neural_threshold:
+                p_big = _clamp(p_ensemble_after_learning, 0.06, 0.94)
+                neural_override_info = {
+                    "override": True,
+                    "from_policy": policy_side,
+                    "to_neural": neural_side,
+                    "edge": round(neural_edge, 4),
+                    "threshold": neural_threshold,
+                }
+            phase = policy_info.get("phase")
+            if neural_override_info.get("override"):
+                source = "NEURAL_HEAD_OVERRIDE_V10"
+            elif phase == "ONLINE_POLICY_LEARNED_V8":
+                source = "ONLINE_POLICY_LEARNED_V8"
+            elif phase == "NEURAL_LOSS_BRAIN_V10":
+                source = "NEURAL_LOSS_BRAIN_V10"
+                self.stats["loss_brain_overrides"] = int(self.stats.get("loss_brain_overrides", 0) or 0) + 1
+            else:
+                source = "AI_DRAWDOWN_POLICY_V10"
             p_big, policy_memory_info = self._policy_memory_correction(p_big, policy_info, consec_loss=consec_losses)
             if policy_memory_info.get("override"):
-                source = "AI_ONLINE_DRAWDOWN_MEMORY_V9"
+                source = "AI_ONLINE_DRAWDOWN_MEMORY_V10"
 
         side = "B" if p_big >= 0.5 else "S"
 
@@ -1454,11 +1696,16 @@ class OnlineAIPredictor:
                 "side": side,
                 "prob_big": p_big,
                 "nn_prob_big": p_nn,
+                "nn_main_prob_big": p_main,
+                "nn_fast_prob_big": p_fast,
+                "nn_slow_prob_big": p_slow,
+                "ensemble_prob_big": p_ensemble_after_learning,
                 "signature": summary["signature"],
                 "memory_keys": keys,
                 "expert_votes": votes,
                 "policy": policy_info,
                 "policy_memory": policy_memory_info,
+                "neural_override": neural_override_info,
                 "event_id": str(event_id or ""),
                 "context": summary,
                 "source": source,
@@ -1467,10 +1714,16 @@ class OnlineAIPredictor:
         meta = {
             "source": source,
             "version": VERSION,
-            "model": "online_mlp_plus_adaptive_expert_ensemble",
+            "model": "v10_multi_speed_online_neural_net_plus_loss_brain",
             "prob_big": round(p_big, 4),
             "prob_small": round(1.0 - p_big, 4),
             "nn_prob_big": round(p_nn, 4),
+            "nn_heads": {
+                "main": round(p_main, 4),
+                "fast": round(p_fast, 4),
+                "slow": round(p_slow, 4),
+                "ensemble_after_learning": round(p_ensemble_after_learning, 4),
+            },
             "confidence": conf,
             "skip": False,
             "ensemble": ensemble_info,
@@ -1479,6 +1732,7 @@ class OnlineAIPredictor:
             "risk": risk_info,
             "policy": policy_info,
             "policy_memory": policy_memory_info,
+            "neural_override": neural_override_info,
             "context": summary,
             "learning": self.learning_status(compact=True),
         }
@@ -1552,9 +1806,22 @@ class OnlineAIPredictor:
         for _ in range(steps):
             loss, _p = self.model.train(prediction["features"], target, weight=weight)
             losses.append(loss)
+        # Fast head gets heavier loss correction for immediate live adaptation;
+        # slow head learns softly to preserve long-term signal.
+        fast_steps = 1 if correct else max(7, min(16, steps + 3))
+        slow_steps = 1 if correct else 2
+        fast_losses = []
+        slow_losses = []
+        for _ in range(fast_steps):
+            loss, _p = self.fast_model.train(prediction["features"], target, weight=(1.0 if correct else min(2.8, weight + 0.35)))
+            fast_losses.append(loss)
+        for _ in range(slow_steps):
+            loss, _p = self.slow_model.train(prediction["features"], target, weight=(0.75 if correct else min(1.6, weight * 0.72)))
+            slow_losses.append(loss)
         self._update_experts(prediction, actual_side, correct)
         self._update_memory(prediction, actual_side, actual_number, actual_color, correct)
         self._update_live_policy(prediction, actual_side, correct)
+        self._update_loss_brain(prediction, actual_side, correct)
         self.stats["bets"] = int(self.stats.get("bets", 0) or 0) + 1
         self.stats["hits"] = int(self.stats.get("hits", 0) or 0) + (1 if correct else 0)
         if correct:
@@ -1567,6 +1834,10 @@ class OnlineAIPredictor:
             )
         self.stats["last_train_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.recent.append(1 if correct else 0)
+        cause = self._diagnose_result(prediction, actual_side, correct)
+        if not correct:
+            causes = self.stats.setdefault("loss_causes", {})
+            causes[cause] = int(causes.get(cause, 0) or 0) + 1
         report = {
             "learned": True,
             "correct": correct,
@@ -1576,8 +1847,13 @@ class OnlineAIPredictor:
             "prob_big_before": round(float(prediction.get("prob_big", 0.5)), 4),
             "nn_prob_big_before": round(float(prediction.get("nn_prob_big", 0.5)), 4),
             "training_steps": steps,
+            "fast_training_steps": fast_steps,
+            "slow_training_steps": slow_steps,
+            "loss_cause": cause,
             "loss_before": round(losses[0], 6) if losses else None,
             "loss_after": round(losses[-1], 6) if losses else None,
+            "fast_loss_after": round(fast_losses[-1], 6) if fast_losses else None,
+            "slow_loss_after": round(slow_losses[-1], 6) if slow_losses else None,
             "source": prediction.get("source"),
             "context": prediction.get("context"),
         }
@@ -1643,6 +1919,7 @@ class OnlineAIPredictor:
         self.stats["max_consec_loss"] = 0
         self.stats["risk_overrides"] = 0
         self.stats["memory_overrides"] = 0
+        self.stats["loss_brain_overrides"] = 0
         self.stats["last_train_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.recent.clear()
         self.mistakes.clear()
@@ -1655,6 +1932,12 @@ class OnlineAIPredictor:
             "samples": final_total,
             "walk_forward_wr": self.stats["bootstrap_wr"],
             "memory_contexts": len(self.memory),
+            "loss_brain_contexts": len(self.loss_brain),
+            "neural_heads_samples": {
+                "main": self.model.trained_samples,
+                "fast": self.fast_model.trained_samples,
+                "slow": self.slow_model.trained_samples,
+            },
             "expert_weights_top": sorted(self.expert_weights.items(), key=lambda kv: kv[1], reverse=True)[:8],
             "seconds": round(time.time() - start, 2),
         }
@@ -1664,11 +1947,22 @@ class OnlineAIPredictor:
         bets = int(self.stats.get("bets", 0) or 0)
         hits = int(self.stats.get("hits", 0) or 0)
         top_experts = sorted(self.expert_weights.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        loss_causes = self.stats.get("loss_causes") or {}
         status = {
             "module": NAME,
             "version": VERSION,
-            "engine": "online MLP + adaptive ensemble + V9 loss-analyzer policy memory",
+            "engine": "V10 multi-speed online neural net + adaptive ensemble + real-time loss brain",
+            "trained": True,
+            "online_learning_active": True,
+            "learning_from_wins": True,
+            "learning_from_losses": True,
+            "loss_correction_strength": "losses train fast/main/slow heads with boosted SGD + loss-brain side correction",
             "trained_samples": self.model.trained_samples,
+            "neural_heads_samples": {
+                "main": self.model.trained_samples,
+                "fast": self.fast_model.trained_samples,
+                "slow": self.slow_model.trained_samples,
+            },
             "session_bets": bets,
             "session_hits": hits,
             "session_wr": round(hits / bets, 4) if bets else None,
@@ -1679,19 +1973,27 @@ class OnlineAIPredictor:
             "bootstrap_wr": self.stats.get("bootstrap_wr"),
             "memory_contexts": len(self.memory),
             "live_policy_contexts": len(self.live_policy),
+            "loss_brain_contexts": len(self.loss_brain),
             "risk_overrides": int(self.stats.get("risk_overrides", 0) or 0),
             "memory_overrides": int(self.stats.get("memory_overrides", 0) or 0),
+            "loss_brain_overrides": int(self.stats.get("loss_brain_overrides", 0) or 0),
+            "loss_causes": dict(sorted(loss_causes.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:8]),
             "top_experts": [(name, round(weight, 3)) for name, weight in top_experts],
             "last_loss": round(float(self.model.last_loss), 6) if self.model.last_loss is not None else None,
+            "last_fast_loss": round(float(self.fast_model.last_loss), 6) if self.fast_model.last_loss is not None else None,
+            "last_slow_loss": round(float(self.slow_model.last_loss), 6) if self.slow_model.last_loss is not None else None,
             "last_train_at": self.stats.get("last_train_at"),
             "skip_after": None,
             "active_methods": [
                 "AI_ENSEMBLE_V6",
                 "AI_MEMORY_CORRECTED_V6",
                 "AI_DRAWDOWN_RECOVERY_V6",
-                "AI_DRAWDOWN_POLICY_V9",
+                "AI_DRAWDOWN_POLICY_V10",
+                "NEURAL_LOSS_BRAIN_V10",
                 "ONLINE_POLICY_LEARNED_V8",
-                "AI_ONLINE_DRAWDOWN_MEMORY_V9",
+                "AI_ONLINE_DRAWDOWN_MEMORY_V10",
+                "V10_MULTI_SPEED_NEURAL_HEADS",
+                "NEURAL_HEAD_SHADOW_SCORING_V10",
                 "V9_LOSS_ANALYZER_STATES",
                 "ONLINE_WIN_LOSS_LEARNING",
                 "ONLINE_LOSS_LEARNING",
@@ -1699,6 +2001,21 @@ class OnlineAIPredictor:
         }
         if not compact:
             status["recent_mistakes"] = list(self.mistakes)[:10]
+            risky = []
+            for key, rec in self.loss_brain.items():
+                score = rec.get("score") or {}
+                diff = abs(float(score.get("B", 0) or 0) - float(score.get("S", 0) or 0))
+                if int(rec.get("bets", 0) or 0) > 0:
+                    risky.append({
+                        "key": key[:120],
+                        "bets": int(rec.get("bets", 0) or 0),
+                        "wins": int(rec.get("wins", 0) or 0),
+                        "losses": int(rec.get("losses", 0) or 0),
+                        "learned_side": rec.get("side"),
+                        "score_diff": round(diff, 2),
+                    })
+            risky.sort(key=lambda r: (r["losses"], r["score_diff"], r["bets"]), reverse=True)
+            status["loss_brain_top_contexts"] = risky[:10]
             status["expert_recent_wr"] = {
                 name: round(sum(vals) / len(vals), 3) if vals else None
                 for name, vals in self.expert_recent.items()

@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v54-ai-v9-loss-analyzer"
+VERSION = "v55-ai-v10-neural-loss-brain"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -78,7 +78,7 @@ DRAW_STORE_FILE = os.getenv("DRAW_STORE_FILE", "wingo30s.json")
 _DRAW_STORE_DEFAULT_MIRROR = "wingo30s_history.json" if DRAW_STORE_FILE != "wingo30s_history.json" else "wingo30s.json"
 DRAW_STORE_MIRROR_FILES = os.getenv("DRAW_STORE_MIRROR_FILES", _DRAW_STORE_DEFAULT_MIRROR)
 AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")
-# V9 trains a recent live window at startup (fast) and then keeps learning every
+# V10 trains a recent live window at startup (fast) and then keeps learning every
 # settled round. Full 10K training is too slow on small hosts, so keep a cap.
 AI_DISABLE_BOOTSTRAP_TRAIN = (os.getenv("AI_DISABLE_BOOTSTRAP_TRAIN", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
 _AI_BOOTSTRAP_EPOCHS_RAW = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "1") or 1)
@@ -972,7 +972,7 @@ class Engine:
                 "trained": True,
                 "bootstrap_trained": False,
                 "online_learning_active": True,
-                "reason": "AI_BOOTSTRAP_EPOCHS=0; live online learning + embedded V9 loss-analyzer policy active",
+                "reason": "AI_BOOTSTRAP_EPOCHS=0; live online neural loss-brain + embedded V10 policy active",
                 "records": len(records),
                 "source": source_name,
             }
@@ -1768,6 +1768,37 @@ def ai_analysis(request: Request):
             "note": "generated from local draw store fallback",
         }
     return {"success": False, "detail": "analysis not ready", "data_source": dict(DATA_SOURCE)}
+
+
+@app.get("/api/ai/loss-brain")
+def ai_loss_brain(request: Request):
+    """Live explanation of why losses happened and what the AI learned."""
+    require_vps_auth(request)
+    status = pattern.learning_status()
+    with ENGINE.lock:
+        current = {
+            "period": ENGINE.latest.get("period"),
+            "prediction": ENGINE.latest.get("prediction"),
+            "consec_losses": ENGINE.loss.consec_losses,
+            "level": ENGINE.loss.level,
+            "source": ENGINE.latest.get("source"),
+        }
+    return {
+        "success": True,
+        "version": VERSION,
+        "current": current,
+        "engine": status.get("engine"),
+        "trained": status.get("trained"),
+        "online_learning_active": status.get("online_learning_active"),
+        "learning_from_wins": status.get("learning_from_wins"),
+        "learning_from_losses": status.get("learning_from_losses"),
+        "neural_heads_samples": status.get("neural_heads_samples"),
+        "loss_brain_contexts": status.get("loss_brain_contexts"),
+        "loss_brain_overrides": status.get("loss_brain_overrides"),
+        "loss_causes": status.get("loss_causes"),
+        "loss_brain_top_contexts": status.get("loss_brain_top_contexts"),
+        "recent_mistakes": status.get("recent_mistakes"),
+    }
 
 
 @app.get("/api/source/status")
