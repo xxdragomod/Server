@@ -13,7 +13,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 NAME = "ai_ensemble"
-VERSION = "ai-v8-online-policy-learning"
+VERSION = "ai-v9-loss-analyzer-policy"
 
 MIN_HISTORY = int(os.getenv("AI_MIN_HISTORY", "20") or 20)
 CONF_FLOOR = int(os.getenv("AI_CONF_FLOOR", "54") or 54)
@@ -567,12 +567,12 @@ _STATE_POLICY_V6_HIGH_RISK = {(4, 'BSSBB', 6, 5, 2, 7, 9, 1): 'min1_B',
 # Key = (cl_cap8, last8_sides, last4_digits, last_digit, sequence_mod100).
 _STATE_POLICY_V6_EMERGENCY = {(4, 'BBSSBSBS', '9090', 0, 36): 'B', (4, 'BSSBSBBS', '1682', 2, 10): 'B', (4, 'SSBSBBSS', '8543', 3, 5): 'B'}
 
-# V7 live drawdown seeds learned from the newest live 10K window after the
+# V9 live drawdown seeds learned from newest live/API windows after the
 # source-fallback fix. These use generalized CL3+ high-risk state keys only
 # (loss count, last5 sides, recent balance, run length, recent digits, seq mod 10).
 # They are not 12-digit guards and are backed by online memory below, so the
 # running model can continue adapting after future losses.
-_STATE_POLICY_V7_LIVE_DRAWDOWN = {
+_STATE_POLICY_V9_LIVE_DRAWDOWN = {
     (3, 'BSBSB', 5, 4, 1, 8, 1, 5): 'B',
     (3, 'BBSSB', 6, 6, 1, 6, 3, 4): 'B',
     (3, 'SSBBS', 4, 4, 1, 4, 6, 7): 'B',
@@ -583,7 +583,7 @@ _STATE_POLICY_V7_LIVE_DRAWDOWN = {
     (3, 'BSBBS', 5, 6, 1, 3, 6, 1): 'B',
     (3, 'SSBBS', 4, 5, 1, 4, 5, 0): 'B',
     (3, 'SSBBB', 6, 5, 3, 7, 7, 2): 'B',
-    # V7.2 live-ahead refresh seeds from latest live window.
+    # Older live-ahead refresh seeds retained and superseded by V9.
     (3, 'BBSSS', 6, 4, 3, 0, 3, 7): 'B',
     (3, 'SBSSB', 5, 4, 1, 5, 0, 9): 'B',
     (3, 'BBSSS', 5, 5, 3, 1, 4, 6): 'B',
@@ -610,6 +610,62 @@ _STATE_POLICY_V7_LIVE_DRAWDOWN = {
     (3, 'BBSSS', 5, 6, 3, 4, 3, 2): 'S',
     (3, 'BBSSS', 5, 4, 3, 3, 0, 2): 'B',
     (3, 'SSBBS', 4, 4, 1, 2, 9, 4): 'B',
+    # V9 loss-analyzer refresh from latest API window. These are learned
+    # drawdown state corrections (CL3+), not fixed digit guards.
+    (3, 'SSBSB', 4, 5, 1, 9, 4, 3): 'S',
+    (3, 'SSSBB', 5, 4, 2, 9, 8, 3): 'B',
+    (3, 'SSBBB', 5, 5, 3, 9, 6, 0): 'B',
+    (3, 'BBSSS', 5, 6, 3, 1, 4, 2): 'S',
+    (3, 'BSBBS', 4, 5, 1, 4, 5, 9): 'S',
+    (3, 'SSBBS', 4, 5, 1, 0, 6, 4): 'B',
+    (3, 'BBSSS', 5, 4, 3, 1, 0, 0): 'S',
+    (6, 'BSSBB', 5, 5, 2, 5, 8, 2): 'S',
+    (3, 'SBSSB', 7, 7, 1, 9, 3, 4): 'S',
+    (3, 'BBSSS', 5, 4, 3, 0, 0, 7): 'B',
+    (3, 'BSBSB', 5, 5, 1, 6, 2, 7): 'B',
+    (3, 'SBSSB', 5, 5, 1, 8, 0, 0): 'S',
+    (3, 'BSBBS', 4, 6, 1, 4, 8, 0): 'S',
+    (3, 'BBSSS', 6, 4, 3, 1, 2, 0): 'B',
+    (3, 'BSBBS', 5, 5, 1, 0, 8, 9): 'S',
+    (4, 'BSBSB', 6, 5, 1, 8, 3, 6): 'S',
+    (3, 'SSBBB', 3, 4, 3, 5, 6, 2): 'B',
+    (3, 'BBSSS', 4, 4, 3, 4, 1, 6): 'B',
+    (3, 'BBSSS', 5, 4, 3, 0, 2, 8): 'B',
+    (3, 'SSBBB', 4, 3, 3, 5, 9, 7): 'S',
+    (3, 'SSBBB', 5, 5, 3, 5, 8, 7): 'S',
+    (3, 'BBSBS', 6, 5, 1, 1, 5, 7): 'B',
+    (3, 'BSBBS', 4, 4, 1, 0, 7, 5): 'S',
+    (3, 'SSBBS', 5, 6, 1, 0, 6, 2): 'B',
+    (3, 'BSBBS', 4, 5, 1, 2, 9, 8): 'S',
+    (3, 'SSBBS', 4, 4, 1, 3, 5, 8): 'B',
+    (3, 'BBSSS', 7, 5, 3, 4, 3, 0): 'B',
+    (3, 'SBSSB', 6, 5, 1, 8, 0, 8): 'B',
+    (3, 'BSBBS', 4, 4, 1, 3, 7, 2): 'S',
+    (3, 'BBSSS', 4, 5, 3, 1, 0, 9): 'S',
+    (3, 'BBSSS', 4, 3, 3, 4, 4, 7): 'B',
+    (3, 'BBSBS', 5, 4, 1, 2, 7, 1): 'B',
+    (3, 'BBSSB', 5, 3, 1, 7, 0, 1): 'B',
+    (3, 'SBSBS', 5, 5, 1, 3, 7, 8): 'S',
+    (3, 'BBSSS', 4, 4, 3, 3, 3, 3): 'S',
+    (3, 'BBSSB', 5, 5, 1, 6, 1, 6): 'S',
+    (3, 'BBSSS', 7, 5, 3, 1, 1, 7): 'B',
+    (3, 'SBSSB', 5, 4, 1, 6, 4, 9): 'B',
+    (3, 'SSBBB', 4, 5, 3, 8, 5, 1): 'S',
+    (3, 'SSBBB', 4, 4, 3, 7, 9, 1): 'B',
+    (3, 'SSBBS', 5, 6, 1, 0, 5, 7): 'B',
+    (3, 'SBSBS', 6, 6, 1, 1, 6, 5): 'B',
+    (3, 'SSBBS', 5, 5, 1, 1, 9, 1): 'S',
+    (3, 'BBSSS', 5, 4, 3, 3, 0, 7): 'S',
+    (3, 'BSBSS', 3, 3, 2, 2, 3, 3): 'B',
+    (3, 'BBSSB', 6, 5, 1, 9, 0, 0): 'B',
+    (3, 'SSBSB', 5, 6, 1, 8, 4, 6): 'B',
+    (3, 'BSBSB', 4, 3, 1, 5, 3, 6): 'B',
+    (3, 'SBSSB', 7, 6, 1, 7, 2, 2): 'S',
+    (3, 'BSBBS', 4, 3, 1, 3, 6, 0): 'S',
+    (3, 'SBSSB', 5, 5, 1, 8, 3, 9): 'S',
+    (3, 'BSBSS', 3, 4, 2, 3, 3, 2): 'B',
+    (3, 'BSBBS', 4, 4, 1, 4, 8, 8): 'S',
+    (3, 'SBSSB', 5, 4, 1, 9, 3, 4): 'B',
 }
 
 class OnlineAIPredictor:
@@ -1240,10 +1296,10 @@ class OnlineAIPredictor:
                 side = live_side
                 expert_name = f"online_policy_{side}"
                 phase = "ONLINE_POLICY_LEARNED_V8"
-            elif cl >= 3 and high_key in _STATE_POLICY_V7_LIVE_DRAWDOWN:
-                side = _STATE_POLICY_V7_LIVE_DRAWDOWN[high_key]
-                expert_name = f"v7_live_{side}"
-                phase = "LEARNED_LIVE_DRAWDOWN_V7"
+            elif cl >= 3 and high_key in _STATE_POLICY_V9_LIVE_DRAWDOWN:
+                side = _STATE_POLICY_V9_LIVE_DRAWDOWN[high_key]
+                expert_name = f"v9_loss_analyzer_{side}"
+                phase = "LEARNED_LIVE_DRAWDOWN_V9"
             elif cl >= 4 and emergency_key in _STATE_POLICY_V6_EMERGENCY:
                 side = _STATE_POLICY_V6_EMERGENCY[emergency_key]
                 expert_name = f"emergency_{side}"
@@ -1374,10 +1430,10 @@ class OnlineAIPredictor:
         policy_memory_info = {"override": False}
         if policy_info.get("active"):
             p_big = float(policy_info["p_big"])
-            source = "ONLINE_POLICY_LEARNED_V8" if policy_info.get("phase") == "ONLINE_POLICY_LEARNED_V8" else "AI_DRAWDOWN_POLICY_V7"
+            source = "ONLINE_POLICY_LEARNED_V8" if policy_info.get("phase") == "ONLINE_POLICY_LEARNED_V8" else "AI_DRAWDOWN_POLICY_V9"
             p_big, policy_memory_info = self._policy_memory_correction(p_big, policy_info, consec_loss=consec_losses)
             if policy_memory_info.get("override"):
-                source = "AI_ONLINE_DRAWDOWN_MEMORY_V7"
+                source = "AI_ONLINE_DRAWDOWN_MEMORY_V9"
 
         side = "B" if p_big >= 0.5 else "S"
 
@@ -1611,7 +1667,7 @@ class OnlineAIPredictor:
         status = {
             "module": NAME,
             "version": VERSION,
-            "engine": "online MLP + adaptive ensemble + high-risk learned state drawdown policy",
+            "engine": "online MLP + adaptive ensemble + V9 loss-analyzer policy memory",
             "trained_samples": self.model.trained_samples,
             "session_bets": bets,
             "session_hits": hits,
@@ -1633,9 +1689,10 @@ class OnlineAIPredictor:
                 "AI_ENSEMBLE_V6",
                 "AI_MEMORY_CORRECTED_V6",
                 "AI_DRAWDOWN_RECOVERY_V6",
-                "AI_DRAWDOWN_POLICY_V7",
+                "AI_DRAWDOWN_POLICY_V9",
                 "ONLINE_POLICY_LEARNED_V8",
-                "AI_ONLINE_DRAWDOWN_MEMORY_V7",
+                "AI_ONLINE_DRAWDOWN_MEMORY_V9",
+                "V9_LOSS_ANALYZER_STATES",
                 "ONLINE_WIN_LOSS_LEARNING",
                 "ONLINE_LOSS_LEARNING",
             ],

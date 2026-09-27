@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("drago")
 
 STREAM_ID = "wingo_30s"
-VERSION = "v53-persistent-alltime-besttime"
+VERSION = "v54-ai-v9-loss-analyzer"
 
 # History source.  Prefer old host env names too, so deployments that already
 # had API_URL/SOURCE_API keep working "jaise pehle tha".
@@ -78,7 +78,7 @@ DRAW_STORE_FILE = os.getenv("DRAW_STORE_FILE", "wingo30s.json")
 _DRAW_STORE_DEFAULT_MIRROR = "wingo30s_history.json" if DRAW_STORE_FILE != "wingo30s_history.json" else "wingo30s.json"
 DRAW_STORE_MIRROR_FILES = os.getenv("DRAW_STORE_MIRROR_FILES", _DRAW_STORE_DEFAULT_MIRROR)
 AI_ANALYSIS_FILE = os.getenv("AI_ANALYSIS_FILE", "ai_analysis.json")
-# V7 trains a recent live window at startup (fast) and then keeps learning every
+# V9 trains a recent live window at startup (fast) and then keeps learning every
 # settled round. Full 10K training is too slow on small hosts, so keep a cap.
 AI_DISABLE_BOOTSTRAP_TRAIN = (os.getenv("AI_DISABLE_BOOTSTRAP_TRAIN", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
 _AI_BOOTSTRAP_EPOCHS_RAW = int(os.getenv("AI_BOOTSTRAP_EPOCHS", "1") or 1)
@@ -972,7 +972,7 @@ class Engine:
                 "trained": True,
                 "bootstrap_trained": False,
                 "online_learning_active": True,
-                "reason": "AI_BOOTSTRAP_EPOCHS=0; live online learning + embedded V7 learned policy active",
+                "reason": "AI_BOOTSTRAP_EPOCHS=0; live online learning + embedded V9 loss-analyzer policy active",
                 "records": len(records),
                 "source": source_name,
             }
